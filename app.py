@@ -1,7 +1,8 @@
 import os
 import PIL.Image
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from pypdf import PdfReader
 
 st.set_page_config(page_title="Wine List Value Scanner", page_icon="🍷")
@@ -15,7 +16,8 @@ api_key = st.secrets.get("GEMINI_API_KEY")
 if not api_key:
     st.error("Please add your GEMINI_API_KEY in the Streamlit app settings.")
 else:
-    genai.configure(api_key=api_key)
+    # Initialize the modern Google GenAI client (fully compatible with AQ keys)
+    client = genai.Client(api_key=api_key)
     
     uploaded_file = st.file_uploader("Snap or Choose Wine List", type=["jpg", "jpeg", "png", "pdf"])
     
@@ -50,10 +52,11 @@ else:
 
         if st.button("🔍 Analyze Wine List", type="primary"):
             with st.spinner("Analyzing wine list and calculating retail values..."):
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                
                 try:
-                    response = model.generate_content(content_to_analyze)
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=content_to_analyze
+                    )
                     st.markdown("### 📊 Value Analysis")
                     st.markdown(response.text)
                 except Exception as e:
