@@ -1,8 +1,10 @@
 import os
+import io
+import json
+import base64
 import PIL.Image
 import streamlit as st
-from google import genai
-from google.genai import types
+import requests
 from pypdf import PdfReader
 
 st.set_page_config(page_title="Wine List Value Scanner", page_icon="🍷")
@@ -10,15 +12,11 @@ st.set_page_config(page_title="Wine List Value Scanner", page_icon="🍷")
 st.title("🍷 Wine List Value Scanner")
 st.write("Take or upload a photo or PDF of a restaurant wine list to spot top values and markup estimates.")
 
-# Retrieve the Gemini API key from Streamlit secrets
 api_key = st.secrets.get("GEMINI_API_KEY")
 
 if not api_key:
     st.error("Please add your GEMINI_API_KEY in the Streamlit app settings.")
 else:
-    # Initialize the modern Google GenAI client (fully compatible with AQ keys)
-    client = genai.Client(api_key=api_key)
-    
     uploaded_file = st.file_uploader("Snap or Choose Wine List", type=["jpg", "jpeg", "png", "pdf"])
     
     if uploaded_file is not None:
@@ -36,28 +34,46 @@ else:
         Format the output cleanly with clear headers, bullet points, and value badges for each wine.
         """
         
-        content_to_analyze = None
+        parts = [{"text": prompt}]
         
         if file_type in ["jpg", "jpeg", "png"]:
             image = PIL.Image.open(uploaded_file)
             st.image(image, caption="Uploaded Wine List", use_container_width=True)
-            content_to_analyze = [prompt, image]
+            
+            # Convert image to bytes for direct API call
+            buffered = io.BytesIO()
+            image.save(buffered, format="JPEG")
+            img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            
+            parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": img_base64
+                }
+            })
         elif file_type == "pdf":
             st.success(f"Uploaded PDF: {uploaded_file.name}")
             reader = PdfReader(uploaded_file)
             pdf_text = ""
             for page in reader.pages:
                 pdf_text += page.extract_text() or ""
-            content_to_analyze = f"{prompt}\n\nWine List Content:\n{pdf_text}"
+            parts[0]["text"] = f"{prompt}\n\nWine List Content:\n{pdf_text}"
 
         if st.button("🔍 Analyze Wine List", type="primary"):
             with st.spinner("Analyzing wine list and calculating retail values..."):
                 try:
-                    response = client.models.generate_content(
-                        model='gemini-2.5-flash',
-                        contents=content_to_analyze
-                    )
-                    st.markdown("### 📊 Value Analysis")
-                    st.markdown(response.text)
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+                    headers = {"Content-Type": "application/json"}
+                    payload = {"contents": [{"parts": parts}]}
+                    
+                    response = requests.post(url, headers=headers, data=json.dumps(payload))
+                    result = response.json()
+                    
+                    if response.status_code == 200:
+                        analysis_text = result["candidates"][0]["content"]["parts"][0]["text"]
+                        st.markdown("### 📊 Value Analysis")
+                        st.markdown(analysis_text)
+                    else:
+                        st.error(f"API Error: {result}")
                 except Exception as e:
                     st.error(f"Error analyzing document: {e}")
