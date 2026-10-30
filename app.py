@@ -61,12 +61,15 @@ else:
         if st.button("🔍 Analyze Wine List", type="primary"):
             with st.spinner("Analyzing wine list and calculating retail values..."):
                 try:
-                    # Using the native header format explicitly required for AQ keys
                     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-                    headers = {
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": api_key.strip()
-                    }
+                    
+                    headers = {"Content-Type": "application/json"}
+                    # Automatically use Bearer token header for AQ tokens, and API key header for AIza keys
+                    if api_key.strip().startswith("AQ."):
+                        headers["Authorization"] = f"Bearer {api_key.strip()}"
+                    else:
+                        headers["x-goog-api-key"] = api_key.strip()
+                        
                     payload = {"contents": [{"parts": parts}]}
                     
                     response = requests.post(url, headers=headers, data=json.dumps(payload))
