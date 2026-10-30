@@ -40,7 +40,6 @@ else:
             image = PIL.Image.open(uploaded_file)
             st.image(image, caption="Uploaded Wine List", use_container_width=True)
             
-            # Convert image to bytes for direct API call
             buffered = io.BytesIO()
             image.save(buffered, format="JPEG")
             img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -62,8 +61,12 @@ else:
         if st.button("🔍 Analyze Wine List", type="primary"):
             with st.spinner("Analyzing wine list and calculating retail values..."):
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-                    headers = {"Content-Type": "application/json"}
+                    # Using the native header format explicitly required for AQ keys
+                    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+                    headers = {
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": api_key.strip()
+                    }
                     payload = {"contents": [{"parts": parts}]}
                     
                     response = requests.post(url, headers=headers, data=json.dumps(payload))
