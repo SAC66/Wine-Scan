@@ -252,7 +252,9 @@ except Exception as e:
     st.error(
         "Couldn't connect to Gemini with this API key. Common causes: a typo or extra quotes in "
         "the secret, the key was deleted, or the Generative Language API isn't enabled for its project. "
-        "Create a fresh key at https://aistudio.google.com/apikey and paste it into Secrets."
+        "Create a fresh key at https://aistudio.google.com/apikey and paste it into Secrets.\n\n"
+        f"The key this app is using is **{len(api_key)} characters** long and ends in **…{api_key[-4:]}**. "
+        "Compare that with the key ending shown on the AI Studio API Keys page."
     )
     with st.expander("Technical details"):
         st.code(str(e))
