@@ -50,6 +50,25 @@ class WineList(BaseModel):
     wines: list[Wine]
 
 
+# label -> (symbol, currency name, retail market to price against)
+CURRENCIES = {
+    "US Dollars ($)": ("$", "US dollars", "the United States"),
+    "British Pounds (£)": ("£", "British pounds", "the United Kingdom"),
+    "Euros (€)": ("€", "euros", "the eurozone (France, Germany, Italy, etc.)"),
+    "Canadian Dollars (C$)": ("C$", "Canadian dollars", "Canada"),
+    "Australian Dollars (A$)": ("A$", "Australian dollars", "Australia"),
+}
+
+
+def currency_note(label: str) -> str:
+    sym, name, market = CURRENCIES[label]
+    return (
+        f"\n\nIMPORTANT: All prices on this list are in {name}, even if no currency symbol is "
+        f"printed. Estimate retail prices as a shopper in {market} would pay, in {name}. "
+        f"Set currency to '{sym}'."
+    )
+
+
 PROMPT = """You are an expert sommelier and wine-pricing analyst.
 
 Extract EVERY wine on this restaurant wine list (all pages/images provided).
@@ -182,10 +201,10 @@ def to_parts(files) -> list[types.Part]:
     return parts
 
 
-def analyze(client, model: str, parts: list[types.Part]) -> WineList:
+def analyze(client, model: str, parts: list[types.Part], prompt: str) -> WineList:
     resp = client.models.generate_content(
         model=model,
-        contents=[*parts, PROMPT],
+        contents=[*parts, prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=WineList,
@@ -208,14 +227,14 @@ def is_busy_or_missing(msg: str) -> bool:
     return any(k.lower() in msg.lower() for k in keys)
 
 
-def analyze_with_fallback(client, model: str, parts, status) -> tuple[WineList, str]:
+def analyze_with_fallback(client, model: str, parts, prompt: str, status) -> tuple[WineList, str]:
     """Try the chosen model, then the backups, so one overloaded model doesn't sink the scan."""
     candidates = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
     errors = []
     for m in candidates:
         status.update(label=f"Reading the list and estimating retail prices with {m}… (30–90 s)")
         try:
-            return analyze(client, m, parts), m
+            return analyze(client, m, parts, prompt), m
         except Exception as e:
             msg = str(e)
             if not is_busy_or_missing(msg):
@@ -323,11 +342,20 @@ if files:
                 except Exception:
                     cols[i % len(cols)].warning(f"Can't preview {f.name}")
 
-    files_key = tuple((f.name, f.size) for f in files)
+    cur_label = st.selectbox(
+        "Prices on this list are in",
+        list(CURRENCIES),
+        key="currency",
+        help="Retail prices are estimated for this country, so pick where the restaurant is.",
+    )
+    files_key = (tuple((f.name, f.size) for f in files), cur_label)
     if st.button("🔍 Analyze Wine List", type="primary"):
         with st.status("Analyzing…", expanded=False) as status:
             try:
-                result, used = analyze_with_fallback(client, model, to_parts(files), status)
+                result, used = analyze_with_fallback(
+                    client, model, to_parts(files), PROMPT + currency_note(cur_label), status
+                )
+                result.currency = CURRENCIES[cur_label][0]
                 st.session_state["result"] = result
                 st.session_state["files_key"] = files_key
                 st.session_state["used_model"] = used
@@ -350,7 +378,10 @@ if files:
                 st.stop()
 
 result = st.session_state.get("result")
-if result and files and st.session_state.get("files_key") == tuple((f.name, f.size) for f in files):
+if result and files and st.session_state.get("files_key") == (
+    tuple((f.name, f.size) for f in files),
+    st.session_state.get("currency"),
+):
     df = to_frame(result)
     cur = result.currency or "$"
     if df.empty:
