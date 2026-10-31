@@ -1,4 +1,6 @@
-streamlit
-google-genai
+streamlit>=1.45
+google-genai>=2.0
 Pillow
-pypdf
+pillow-heif
+pandas
+pydantic>=2
