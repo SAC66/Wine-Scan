@@ -1,6 +1,7 @@
 import io
 import os
 import re
+from datetime import date
 
 import pandas as pd
 import PIL.Image
@@ -21,7 +22,9 @@ except ImportError:
 st.set_page_config(page_title="Wine List Value Scanner", page_icon="🍷", layout="wide")
 
 MAX_IMAGE_SIDE = 2400  # downscale big phone photos; plenty for reading a menu
-GEM_MAX, FAIR_MAX = 2.2, 3.2  # markup thresholds (list price / retail)
+THIS_YEAR = date.today().year
+# Default importance of each factor in the overall Value Score (user can change these)
+DEFAULT_WEIGHTS = {"Price vs. retail": 35, "Critic standing": 30, "Drinking window": 20, "Vintage quality": 15}
 # Tried in order if the key can't list models (or the listed pick fails)
 # Lighter models are a last resort for analysis when Google's main models are overloaded
 EXTRA_ANALYSIS_FALLBACKS = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite"]
@@ -40,6 +43,10 @@ class Wine(BaseModel):
     list_price: float = Field(description="Price on the wine list, number only")
     est_retail_price: float = Field(description="Estimated typical retail price for a 750ml bottle (or the listed format) in the list's currency")
     retail_confidence: str = Field(description="High, Medium or Low: how confident you are in the retail estimate")
+    critic_score: int = Field(description="Typical critic score on the 100-point scale for this wine and vintage (consensus of Wine Spectator, Wine Advocate, Vinous, Decanter, Jancis Robinson etc.), 0 if you genuinely don't know")
+    vintage_quality: int = Field(description="Quality of this vintage for this region, 1 (poor) to 5 (outstanding); 0 for NV or unknown")
+    drink_from: int = Field(description="First year of the drinking window (year), 0 if unknown")
+    drink_to: int = Field(description="Last year of the drinking window (year), 0 if unknown")
     underrated: bool = Field(description="True if this is a lesser-known producer/region/grape that drinks well above its price, or a mature vintage priced like a young one")
     note: str = Field(description="One sentence on why it is or isn't a good buy")
 
@@ -69,7 +76,7 @@ def currency_note(label: str) -> str:
     )
 
 
-PROMPT = """You are an expert sommelier and wine-pricing analyst.
+PROMPT_TEMPLATE = """You are an expert sommelier and wine-pricing analyst.
 
 Extract EVERY wine on this restaurant wine list (all pages/images provided).
 For each wine, record producer, name, vintage, region, grape, color, format and list price
@@ -82,11 +89,20 @@ use the price a shopper would pay at a mainstream wine shop, not auction or
 release prices for rare wines. Set retail_confidence to Low when you are unsure
 of the producer or bottling.
 
+Also give, from your knowledge of critic reviews and vintage charts:
+- critic_score: the typical professional critic score for this wine and vintage. If you
+  don't know that exact vintage, use the producer's usual level for that bottling. Use 0
+  only if you know nothing about the wine.
+- vintage_quality: how good the vintage was in that region (1-5).
+- drink_from / drink_to: the drinking window in years. It is now {year}.
+
 Mark `underrated` true for genuine sommelier finds: lesser-known regions, grapes or
 producers that over-deliver, grower Champagne, well-aged back-vintages priced
 modestly, etc. Most wines should be false.
 
-Keep the note to one short, specific sentence."""
+Keep the note to one short, specific sentence that weighs price, quality and readiness."""
+
+PROMPT = PROMPT_TEMPLATE.replace("{year}", str(THIS_YEAR))
 
 
 # ---------------------------------------------------------------- helpers
@@ -244,23 +260,59 @@ def analyze_with_fallback(client, model: str, parts, prompt: str, status) -> tup
     raise RuntimeError("ALL_BUSY\n\n" + "\n\n".join(errors))
 
 
-def rating(markup: float) -> str:
-    if markup < GEM_MAX:
-        return "💎 Top Value"
-    if markup <= FAIR_MAX:
-        return "👍 Fair"
-    return "🚩 High Markup"
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
 
-def to_frame(result: WineList) -> pd.DataFrame:
+def drink_status(w: Wine) -> tuple[str, float]:
+    """(label, 0-100 score) for where the wine is in its drinking window this year."""
+    if not w.drink_from or not w.drink_to:
+        return ("🟢 Ready", 80.0) if w.vintage.upper().startswith("NV") else ("❔ Unknown", 60.0)
+    if THIS_YEAR < w.drink_from - 2:
+        return "🔵 Too young", 20.0
+    if THIS_YEAR < w.drink_from:
+        return "🟡 A bit young", 55.0
+    if THIS_YEAR <= w.drink_to:
+        return "🟢 Drinking well", 100.0
+    if THIS_YEAR <= w.drink_to + 2:
+        return "🟠 Fading", 45.0
+    return "🔴 Past peak", 10.0
+
+
+def value_score(markup: float, w: Wine, drink_pts: float, weights: dict) -> float:
+    """Blend the factors into one 0-100 score using the user's weights."""
+    parts = {
+        "Price vs. retail": 100 * _clamp01((4.0 - markup) / (4.0 - 1.5)),  # 1.5x → 100, 4x → 0
+        "Critic standing": 100 * _clamp01((w.critic_score - 84) / 12) if w.critic_score else 50.0,  # 84 → 0, 96 → 100
+        "Drinking window": drink_pts,
+        "Vintage quality": 25 * (w.vintage_quality - 1) if w.vintage_quality else 60.0,
+    }
+    total = sum(weights.values()) or 1
+    return sum(parts[k] * weights.get(k, 0) for k in parts) / total
+
+
+def rating(score: float) -> str:
+    if score >= 75:
+        return "💎 Great buy"
+    if score >= 60:
+        return "👍 Good buy"
+    if score >= 45:
+        return "😐 Fair"
+    return "🚩 Skip"
+
+
+def to_frame(result: WineList, weights: dict) -> pd.DataFrame:
     rows = []
     for w in result.wines:
         if w.list_price <= 0 or w.est_retail_price <= 0:
             continue
         markup = w.list_price / w.est_retail_price
+        status, drink_pts = drink_status(w)
+        score = value_score(markup, w, drink_pts, weights)
         rows.append(
             {
-                "Rating": rating(markup),
+                "Score": round(score),
+                "Rating": rating(score),
                 "Find": "⭐" if w.underrated else "",
                 "Wine": " ".join(x for x in (w.producer, w.name) if x).strip(),
                 "Vintage": w.vintage,
@@ -271,13 +323,17 @@ def to_frame(result: WineList) -> pd.DataFrame:
                 "List": w.list_price,
                 "Est. Retail": w.est_retail_price,
                 "Markup": round(markup, 2),
+                "Critics": w.critic_score or None,
+                "Vintage ★": "★" * w.vintage_quality if w.vintage_quality else "",
+                "Drink": f"{w.drink_from}–{w.drink_to}" if w.drink_from and w.drink_to else "",
+                "Readiness": status,
                 "Confidence": w.retail_confidence,
                 "Note": w.note,
             }
         )
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("Markup").reset_index(drop=True)
+        df = df.sort_values(["Score", "Markup"], ascending=[False, True]).reset_index(drop=True)
     return df
 
 
@@ -382,7 +438,18 @@ if result and files and st.session_state.get("files_key") == (
     tuple((f.name, f.size) for f in files),
     st.session_state.get("currency"),
 ):
-    df = to_frame(result)
+    with st.expander("⚖️ What matters to you? Adjust how the Value Score is weighted"):
+        wcols = st.columns(len(DEFAULT_WEIGHTS))
+        weights = {
+            k: wc.slider(k, 0, 100, v, step=5, key=f"w_{k}")
+            for wc, (k, v) in zip(wcols, DEFAULT_WEIGHTS.items())
+        }
+        st.caption(
+            "Price vs. retail: restaurant markup over shop price · Critic standing: typical "
+            "professional score · Drinking window: is it ready to drink now · Vintage quality: "
+            "how good the year was in that region."
+        )
+    df = to_frame(result, weights)
     cur = result.currency or "$"
     if df.empty:
         st.warning("No priced wines were found. Try a sharper, well-lit photo with the prices visible.")
@@ -406,29 +473,37 @@ if result and files and st.session_state.get("files_key") == (
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Wines found", len(df))
     m2.metric("Median markup", f"{df['Markup'].median():.1f}×")
-    m3.metric("Top values", int((df["Markup"] < GEM_MAX).sum()))
-    m4.metric("Underrated finds", int((df["Find"] == "⭐").sum()))
+    m3.metric("Great buys", int((df["Score"] >= 75).sum()))
+    m4.metric("Drinking well now", int((df["Readiness"] == "🟢 Drinking well").sum()))
 
     # --- top picks
-    picks = view[(view["Markup"] < FAIR_MAX) & (view["Confidence"] != "Low")]
-    picks = pd.concat([picks[picks["Find"] == "⭐"], picks]).drop_duplicates().head(3)
+    picks = view[(view["Confidence"] != "Low") & (view["Score"] >= 60)].head(3)
     if not picks.empty:
         st.markdown("#### 🏆 Sommelier's picks")
         for col, (_, w) in zip(st.columns(len(picks)), picks.iterrows()):
             with col.container(border=True):
                 st.markdown(f"**{w['Wine']} {w['Vintage']}**  \n{w['Region']}")
                 st.markdown(
-                    f"{cur}{w['List']:,.0f} on list · ~{cur}{w['Est. Retail']:,.0f} retail · **{w['Markup']:.1f}×**"
+                    f"**Value Score {w['Score']}** · {cur}{w['List']:,.0f} on list · "
+                    f"~{cur}{w['Est. Retail']:,.0f} retail ({w['Markup']:.1f}×)"
                 )
+                details = [
+                    f"~{w['Critics']:.0f} pts" if pd.notna(w["Critics"]) else "",
+                    f"vintage {w['Vintage ★']}" if w["Vintage ★"] else "",
+                    f"{w['Readiness']} ({w['Drink']})" if w["Drink"] else w["Readiness"],
+                ]
+                st.markdown(" · ".join(d for d in details if d))
                 st.caption(("⭐ Underrated find. " if w["Find"] else "") + w["Note"])
 
     # --- full table
-    st.markdown("#### All wines (sorted by markup, best value first)")
+    st.markdown("#### All wines (best overall value first)")
     st.dataframe(
         view,
         hide_index=True,
         width="stretch",
         column_config={
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+            "Critics": st.column_config.NumberColumn(format="%d pts"),
             "List": st.column_config.NumberColumn(format=f"{cur}%.0f"),
             "Est. Retail": st.column_config.NumberColumn(format=f"{cur}%.0f"),
             "Markup": st.column_config.NumberColumn(format="%.2f×"),
@@ -439,7 +514,10 @@ if result and files and st.session_state.get("files_key") == (
         "⬇️ Download CSV", view.to_csv(index=False), "wine_list_analysis.csv", "text/csv"
     )
     st.caption(
-        f"Ratings: 💎 under {GEM_MAX}× retail · 👍 {GEM_MAX}–{FAIR_MAX}× · 🚩 over {FAIR_MAX}×. "
-        "Typical restaurant markup is 2.5–3×. Low-confidence estimates are excluded from picks. "
+        "Value Score (0–100) blends price vs. retail, critic standing, drinking window and vintage "
+        "quality using the weights above. 💎 75+ · 👍 60–74 · 😐 45–59 · 🚩 under 45. "
+        "Critic scores, vintage ratings and drinking windows are the AI's recollection of published "
+        "reviews and vintage charts, not a live lookup. Typical restaurant markup is 2.5–3×. "
+        "Low-confidence price estimates are excluded from picks. "
         f"Model: {st.session_state.get('used_model', model)} via {backend}"
     )
