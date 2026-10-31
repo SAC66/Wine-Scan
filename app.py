@@ -22,6 +22,8 @@ st.set_page_config(page_title="Wine List Value Scanner", page_icon="🍷", layou
 
 MAX_IMAGE_SIDE = 2400  # downscale big phone photos; plenty for reading a menu
 GEM_MAX, FAIR_MAX = 2.2, 3.2  # markup thresholds (list price / retail)
+# Tried in order if the key can't list models (or the listed pick fails)
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
 
 
 # ---------------------------------------------------------------- data model
@@ -124,16 +126,29 @@ def connect(api_key: str, model_override: str | None, force_vertex: bool):
         backend = "Vertex AI" if vertex else "Gemini API"
         try:
             client = make_client(api_key, vertex)
-            try:
-                model = model_override or pick_model(client) or "gemini-flash-latest"
-            except Exception:
-                if not model_override and not vertex:
-                    raise  # Gemini API keys can always list models; a failure means the key is wrong here
-                model = model_override or "gemini-flash-latest"
-            client.models.count_tokens(model=model, contents="ping")  # cheap auth + model check
-            return client, model, backend
         except Exception as e:
-            errors.append(f"{backend}: {e}")
+            errors.append(f"{backend} (setup): {e}")
+            continue
+        if model_override:
+            candidates = [model_override]
+        else:
+            try:  # some keys can generate but not list models; that's fine
+                picked = pick_model(client)
+            except Exception as e:
+                picked = None
+                errors.append(f"{backend} (list models): {e}")
+            candidates = [m for m in (picked, *FALLBACK_MODELS) if m]
+            candidates = list(dict.fromkeys(candidates))  # dedupe, keep order
+        for model in candidates:
+            try:  # a tiny real request: the only check that proves key + model both work
+                client.models.generate_content(
+                    model=model,
+                    contents="Reply with OK.",
+                    config=types.GenerateContentConfig(max_output_tokens=50),
+                )
+                return client, model, backend
+            except Exception as e:
+                errors.append(f"{backend} / {model}: {e}")
     raise RuntimeError("\n\n".join(errors))
 
 
@@ -237,7 +252,9 @@ except Exception as e:
     st.error(
         "Couldn't connect to Gemini with this API key. Common causes: a typo or extra quotes in "
         "the secret, the key was deleted, or the Generative Language API isn't enabled for its project. "
-        "Create a fresh key at https://aistudio.google.com/apikey and paste it into Secrets."
+        "Create a fresh key at https://aistudio.google.com/apikey and paste it into Secrets.\n\n"
+        f"The key this app is using is **{len(api_key)} characters** long and ends in **…{api_key[-4:]}**. "
+        "Compare that with the key ending shown on the AI Studio API Keys page."
     )
     with st.expander("Technical details"):
         st.code(str(e))
