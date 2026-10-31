@@ -79,10 +79,16 @@ def get_secret(name, default=None):
     return os.environ.get(name, default)
 
 
+# Quick checks must fail fast: no silent retries, short timeout (the SDK otherwise retries
+# rate-limit errors with backoff, which looks like the app hanging on "Connecting…").
+QUICK = types.HttpOptions(timeout=20_000, retry_options=types.HttpRetryOptions(attempts=1))
+
+
 def make_client(api_key: str, vertex: bool):
+    opts = types.HttpOptions(timeout=180_000)  # full wine-list analysis can take a while
     if vertex:
-        return genai.Client(vertexai=True, api_key=api_key)
-    return genai.Client(api_key=api_key)
+        return genai.Client(vertexai=True, api_key=api_key, http_options=opts)
+    return genai.Client(api_key=api_key, http_options=opts)
 
 
 def _version_key(name: str):
@@ -96,7 +102,7 @@ def pick_model(client) -> str | None:
     Hard-coding a model name is what broke this app before: Google retires models regularly.
     """
     names = []
-    for m in client.models.list():
+    for m in client.models.list(config=types.ListModelsConfig(http_options=QUICK)):
         actions = m.supported_actions or []
         name = (m.name or "").split("/")[-1]
         if actions and "generateContent" not in actions:
@@ -144,7 +150,7 @@ def connect(api_key: str, model_override: str | None, force_vertex: bool):
                 client.models.generate_content(
                     model=model,
                     contents="Reply with OK.",
-                    config=types.GenerateContentConfig(max_output_tokens=50),
+                    config=types.GenerateContentConfig(max_output_tokens=50, http_options=QUICK),
                 )
                 return client, model, backend
             except Exception as e:
