@@ -23,6 +23,8 @@ st.set_page_config(page_title="Wine List Value Scanner", page_icon="🍷", layou
 MAX_IMAGE_SIDE = 2400  # downscale big phone photos; plenty for reading a menu
 GEM_MAX, FAIR_MAX = 2.2, 3.2  # markup thresholds (list price / retail)
 # Tried in order if the key can't list models (or the listed pick fails)
+# Lighter models are a last resort for analysis when Google's main models are overloaded
+EXTRA_ANALYSIS_FALLBACKS = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite"]
 FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
 
 
@@ -188,11 +190,39 @@ def analyze(client, model: str, parts: list[types.Part]) -> WineList:
             response_mime_type="application/json",
             response_schema=WineList,
             temperature=0.2,
+            # we handle "busy" errors ourselves by switching model, so don't retry silently
+            http_options=types.HttpOptions(
+                timeout=180_000, retry_options=types.HttpRetryOptions(attempts=1)
+            ),
         ),
     )
     if resp.parsed is not None:
         return resp.parsed
     return WineList.model_validate_json(resp.text)
+
+
+def is_busy_or_missing(msg: str) -> bool:
+    """Errors worth trying another model for: overloaded, rate-limited, timed out or retired."""
+    keys = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL",
+            "504", "DEADLINE", "timed out", "timeout", "404", "NOT_FOUND")
+    return any(k.lower() in msg.lower() for k in keys)
+
+
+def analyze_with_fallback(client, model: str, parts, status) -> tuple[WineList, str]:
+    """Try the chosen model, then the backups, so one overloaded model doesn't sink the scan."""
+    candidates = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
+    errors = []
+    for m in candidates:
+        status.update(label=f"Reading the list and estimating retail prices with {m}… (30–90 s)")
+        try:
+            return analyze(client, m, parts), m
+        except Exception as e:
+            msg = str(e)
+            if not is_busy_or_missing(msg):
+                raise
+            errors.append(f"{m}: {msg}")
+            status.write(f"⏭️ {m} is busy or unavailable, trying another model…")
+    raise RuntimeError("ALL_BUSY\n\n" + "\n\n".join(errors))
 
 
 def rating(markup: float) -> str:
@@ -295,22 +325,26 @@ if files:
 
     files_key = tuple((f.name, f.size) for f in files)
     if st.button("🔍 Analyze Wine List", type="primary"):
-        with st.spinner(f"Reading the list and estimating retail prices with {model}… (30–90 s)"):
+        with st.status("Analyzing…", expanded=False) as status:
             try:
-                result = analyze(client, model, to_parts(files))
+                result, used = analyze_with_fallback(client, model, to_parts(files), status)
                 st.session_state["result"] = result
                 st.session_state["files_key"] = files_key
+                st.session_state["used_model"] = used
+                status.update(label=f"Done, analyzed with {used}", state="complete")
             except Exception as e:
+                status.update(label="Analysis failed", state="error")
                 msg = str(e)
-                if "404" in msg or "not found" in msg.lower():
+                if msg.startswith("ALL_BUSY"):
                     st.error(
-                        f"Model `{model}` isn't available for this key. Set `GEMINI_MODEL` in secrets "
-                        f"to a current model name.\n\nDetails: {msg}"
+                        "Google's Gemini servers are overloaded right now (this happens to everyone on "
+                        "busy days, especially on the free plan). Wait a minute or two and press "
+                        "**Analyze** again."
                     )
+                    with st.expander("Technical details"):
+                        st.code(msg.removeprefix("ALL_BUSY").strip())
                 elif "API key" in msg or "401" in msg or "403" in msg:
                     st.error(f"Gemini rejected the API key. Check `GEMINI_API_KEY`.\n\nDetails: {msg}")
-                elif "429" in msg:
-                    st.error("Rate limit / quota hit. Wait a minute and try again.")
                 else:
                     st.error(f"Analysis failed: {msg}")
                 st.stop()
@@ -376,5 +410,5 @@ if result and files and st.session_state.get("files_key") == tuple((f.name, f.si
     st.caption(
         f"Ratings: 💎 under {GEM_MAX}× retail · 👍 {GEM_MAX}–{FAIR_MAX}× · 🚩 over {FAIR_MAX}×. "
         "Typical restaurant markup is 2.5–3×. Low-confidence estimates are excluded from picks. "
-        f"Model: {model} via {backend}"
+        f"Model: {st.session_state.get('used_model', model)} via {backend}"
     )
