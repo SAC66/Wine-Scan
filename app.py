@@ -1,6 +1,7 @@
 import io
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
 import pandas as pd
@@ -32,7 +33,8 @@ FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3-flash-pr
 
 
 # ---------------------------------------------------------------- data model
-class Wine(BaseModel):
+# Step 1 reads the list (ListedWine); step 2 evaluates it in batches (Evaluation).
+class ListedWine(BaseModel):
     producer: str
     name: str = Field(description="Cuvée / bottling name, or the varietal if none")
     vintage: str = Field(description="Year, or 'NV'")
@@ -41,19 +43,45 @@ class Wine(BaseModel):
     color: str = Field(description="One of: Red, White, Rosé, Sparkling, Dessert, Orange")
     format: str = Field(description="Bottle size, e.g. '750ml'; 'Glass' if it is a by-the-glass price")
     list_price: float = Field(description="Price on the wine list, number only")
-    est_retail_price: float = Field(description="Estimated typical retail price for a 750ml bottle (or the listed format) in the list's currency")
-    retail_confidence: str = Field(description="High, Medium or Low: how confident you are in the retail estimate")
-    critic_score: int = Field(description="Typical critic score on the 100-point scale for this wine and vintage (consensus of Wine Spectator, Wine Advocate, Vinous, Decanter, Jancis Robinson etc.), 0 if you genuinely don't know")
-    vintage_quality: int = Field(description="Quality of this vintage for this region, 1 (poor) to 5 (outstanding); 0 for NV or unknown")
-    drink_from: int = Field(description="First year of the drinking window (year), 0 if unknown")
-    drink_to: int = Field(description="Last year of the drinking window (year), 0 if unknown")
-    underrated: bool = Field(description="True if this is a lesser-known producer/region/grape that drinks well above its price, or a mature vintage priced like a young one")
-    note: str = Field(description="One sentence on why it is or isn't a good buy")
+
+
+class ListedWines(BaseModel):
+    restaurant: str = Field(description="Restaurant name if visible, else ''")
+    wines: list[ListedWine]
+
+
+class Evaluation(BaseModel):
+    id: int = Field(description="The id number given for the wine")
+    est_retail_price: float = Field(description="Typical retail shop price for this bottle and vintage, number only")
+    retail_confidence: str = Field(description="High, Medium or Low")
+    critic_score: int = Field(description="Estimated professional critic score, 100-point scale. Never 0")
+    quality_basis: str = Field(description="Exactly one of: 'This wine', 'Producer', 'Region/style'")
+    vintage_quality: int = Field(description="Vintage quality for this region, 1 (poor) to 5 (outstanding); 0 only for NV")
+    drink_from: int = Field(description="First year of the drinking window. Never 0")
+    drink_to: int = Field(description="Last year of the drinking window. Never 0")
+    underrated: bool = Field(description="True only for genuine sommelier finds")
+    note: str = Field(description="One short, specific sentence")
+
+
+class Evaluations(BaseModel):
+    evaluations: list[Evaluation]
+
+
+class Wine(ListedWine):
+    est_retail_price: float = 0
+    retail_confidence: str = "Low"
+    critic_score: int = 0
+    quality_basis: str = ""
+    vintage_quality: int = 0
+    drink_from: int = 0
+    drink_to: int = 0
+    underrated: bool = False
+    note: str = ""
 
 
 class WineList(BaseModel):
-    currency: str = Field(description="Currency symbol used on the list, e.g. '$', '€', '£'")
-    restaurant: str = Field(description="Restaurant name if visible, else ''")
+    currency: str
+    restaurant: str
     wines: list[Wine]
 
 
@@ -70,39 +98,47 @@ CURRENCIES = {
 def currency_note(label: str) -> str:
     sym, name, market = CURRENCIES[label]
     return (
-        f"\n\nIMPORTANT: All prices on this list are in {name}, even if no currency symbol is "
-        f"printed. Estimate retail prices as a shopper in {market} would pay, in {name}. "
-        f"Set currency to '{sym}'."
+        f"\nIMPORTANT: All list prices are in {name}, even if no currency symbol is printed. "
+        f"Estimate retail prices as a shopper in {market} would pay, in {name}.\n"
     )
 
 
-PROMPT_TEMPLATE = """You are an expert sommelier and wine-pricing analyst.
+EXTRACT_PROMPT = """You are reading a restaurant wine list (all pages/images provided).
 
-Extract EVERY wine on this restaurant wine list (all pages/images provided).
-For each wine, record producer, name, vintage, region, grape, color, format and list price
-exactly as printed. If both a glass and a bottle price are shown, use the bottle price.
-Skip beers, spirits, cocktails and other non-wine items.
+Extract EVERY wine on it. For each wine, record producer, name, vintage, region, grape,
+color, format and list price exactly as printed (fill region/grape from your knowledge
+if the list only implies them, e.g. by its section heading). If both a glass and a
+bottle price are shown, use the bottle price. Skip beers, spirits, cocktails and
+other non-wine items. Do not skip any wine, however long the list."""
 
-Then, using your knowledge of the wine market, estimate the typical current retail
-(shop) price of that exact bottle and vintage in the same currency. Be realistic:
-use the price a shopper would pay at a mainstream wine shop, not auction or
-release prices for rare wines. Set retail_confidence to Low when you are unsure
-of the producer or bottling.
+EVAL_TEMPLATE = """You are an expert sommelier and wine-pricing analyst. It is now {year}.
 
-Also give, from your knowledge of critic reviews and vintage charts:
-- critic_score: the typical professional critic score for this wine and vintage. If you
-  don't know that exact vintage, use the producer's usual level for that bottling. Use 0
-  only if you know nothing about the wine.
-- vintage_quality: how good the vintage was in that region (1-5).
-- drink_from / drink_to: the drinking window in years. It is now {year}.
+For EVERY wine below, return an evaluation with the same id. Do not skip any.
 
-Mark `underrated` true for genuine sommelier finds: lesser-known regions, grapes or
-producers that over-deliver, grower Champagne, well-aged back-vintages priced
-modestly, etc. Most wines should be false.
+- est_retail_price: the typical current retail (shop) price of that bottle and vintage.
+  Be realistic: a mainstream wine shop, not auction or release prices for rare wines.
+  retail_confidence = Low if you are unsure of the producer or bottling.
+- critic_score: ALWAYS give your best estimate on the 100-point scale; never 0.
+  Work down this ladder and record which step you used in quality_basis:
+    'This wine'    - you know reviews of this wine (this or nearby vintages)
+    'Producer'     - you know the producer's usual level for this kind of bottling
+    'Region/style' - otherwise, what a wine of this appellation, grape, price tier and
+                     vintage typically scores (a $15 retail Côtes du Rhône ~87, a
+                     good Premier Cru Burgundy ~91-93, etc.)
+- vintage_quality: 1-5 from vintage charts for that region (0 only for NV). If the
+  region is obscure, use the nearest major region's vintage as a guide.
+- drink_from / drink_to: ALWAYS give a window (years). If you don't know the wine,
+  use the norms for its style, grape, region and quality level. NV wines: drink now
+  through the next 2-3 years.
+- underrated: true only for genuine sommelier finds: lesser-known regions, grapes or
+  producers that over-deliver, grower Champagne, well-aged back-vintages priced
+  modestly, etc. Most wines should be false.
+- note: one short, specific sentence weighing price, quality and readiness.
 
-Keep the note to one short, specific sentence that weighs price, quality and readiness."""
+Wines (id | wine | list price):
+"""
 
-PROMPT = PROMPT_TEMPLATE.replace("{year}", str(THIS_YEAR))
+EVAL_PROMPT = EVAL_TEMPLATE.replace("{year}", str(THIS_YEAR))
 
 
 # ---------------------------------------------------------------- helpers
@@ -217,13 +253,16 @@ def to_parts(files) -> list[types.Part]:
     return parts
 
 
-def analyze(client, model: str, parts: list[types.Part], prompt: str) -> WineList:
+EVAL_BATCH = 15  # wines per evaluation request: small enough that every wine gets attention
+
+
+def generate_json(client, model: str, contents, schema):
     resp = client.models.generate_content(
         model=model,
-        contents=[*parts, prompt],
+        contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=WineList,
+            response_schema=schema,
             temperature=0.2,
             # we handle "busy" errors ourselves by switching model, so don't retry silently
             http_options=types.HttpOptions(
@@ -233,7 +272,7 @@ def analyze(client, model: str, parts: list[types.Part], prompt: str) -> WineLis
     )
     if resp.parsed is not None:
         return resp.parsed
-    return WineList.model_validate_json(resp.text)
+    return schema.model_validate_json(resp.text)
 
 
 def is_busy_or_missing(msg: str) -> bool:
@@ -243,21 +282,84 @@ def is_busy_or_missing(msg: str) -> bool:
     return any(k.lower() in msg.lower() for k in keys)
 
 
-def analyze_with_fallback(client, model: str, parts, prompt: str, status) -> tuple[WineList, str]:
-    """Try the chosen model, then the backups, so one overloaded model doesn't sink the scan."""
-    candidates = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
+def with_fallback(client, models: list[str], contents, schema, log):
+    """Try each model in turn so one overloaded model doesn't sink the scan. Returns (result, model)."""
     errors = []
-    for m in candidates:
-        status.update(label=f"Reading the list and estimating retail prices with {m}… (30–90 s)")
+    for m in models:
         try:
-            return analyze(client, m, parts, prompt), m
+            return generate_json(client, m, contents, schema), m
         except Exception as e:
             msg = str(e)
             if not is_busy_or_missing(msg):
                 raise
             errors.append(f"{m}: {msg}")
-            status.write(f"⏭️ {m} is busy or unavailable, trying another model…")
+            log(f"⏭️ {m} is busy or unavailable, trying another model…")
     raise RuntimeError("ALL_BUSY\n\n" + "\n\n".join(errors))
+
+
+def describe(w: ListedWine) -> str:
+    bits = [w.producer, w.name, w.vintage, w.region, w.grape, w.color]
+    fmt = "" if w.format.lower() in ("", "750ml", "750 ml", "bottle") else f" [{w.format}]"
+    return " · ".join(b for b in bits if b) + fmt
+
+
+def analyze(client, model: str, parts, cur_label: str, status) -> tuple[WineList, str]:
+    """Step 1: read the list. Step 2: evaluate it in batches (in parallel)."""
+    models = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
+    sym = CURRENCIES[cur_label][0]
+
+    status.update(label="Step 1 of 2: reading the wine list… (20–60 s)")
+    listed, used = with_fallback(client, models, [*parts, EXTRACT_PROMPT], ListedWines, status.write)
+    wines = [w for w in listed.wines if w.list_price > 0]
+    if not wines:
+        return WineList(currency=sym, restaurant=listed.restaurant, wines=[]), used
+    status.write(f"📋 Found {len(wines)} wines")
+
+    # Keep using whichever model worked, with the others as backups
+    models = [used, *[m for m in models if m != used]]
+    batches = [list(range(i, min(i + EVAL_BATCH, len(wines)))) for i in range(0, len(wines), EVAL_BATCH)]
+    evals: dict[int, Evaluation] = {}
+    messages: list[str] = []
+
+    def run_batch(ids):
+        lines = "\n".join(f"{i} | {describe(wines[i])} | {sym}{wines[i].list_price:g}" for i in ids)
+        prompt = EVAL_PROMPT + lines + "\n" + currency_note(cur_label)
+        out, _ = with_fallback(client, models, prompt, Evaluations, messages.append)
+        return out.evaluations
+
+    status.update(label=f"Step 2 of 2: evaluating {len(wines)} wines… (30–90 s)")
+    done = 0
+    with ThreadPoolExecutor(max_workers=3) as pool:  # modest parallelism for free-tier rate limits
+        futures = [pool.submit(run_batch, ids) for ids in batches]
+        for fut in as_completed(futures):
+            try:
+                for e in fut.result():
+                    evals[e.id] = e
+            except Exception as e:  # one failed batch shouldn't lose the whole list
+                messages.append(f"⚠️ A batch failed: {str(e)[:200]}")
+            done += 1
+            status.update(label=f"Step 2 of 2: evaluated {done}/{len(batches)} batches…")
+
+    # Re-ask once for any wines the model skipped
+    missing = [i for i in range(len(wines)) if i not in evals]
+    if missing and len(missing) < len(wines):
+        status.write(f"🔁 Re-checking {len(missing)} wines that were skipped…")
+        try:
+            for e in run_batch(missing):
+                evals[e.id] = e
+        except Exception as e:
+            messages.append(f"⚠️ Re-check failed: {str(e)[:200]}")
+    for m in dict.fromkeys(messages):
+        status.write(m)
+    if not evals:
+        raise RuntimeError("ALL_BUSY\n\n" + "\n".join(messages))
+
+    merged = []
+    for i, w in enumerate(wines):
+        e = evals.get(i)
+        extra = e.model_dump(exclude={"id"}) if e else {}
+        merged.append(Wine(**w.model_dump(), **extra))
+    return WineList(currency=sym, restaurant=listed.restaurant, wines=merged), used
 
 
 def _clamp01(x: float) -> float:
@@ -304,15 +406,18 @@ def rating(score: float) -> str:
 def to_frame(result: WineList, weights: dict) -> pd.DataFrame:
     rows = []
     for w in result.wines:
-        if w.list_price <= 0 or w.est_retail_price <= 0:
+        if w.list_price <= 0:
             continue
-        markup = w.list_price / w.est_retail_price
         status, drink_pts = drink_status(w)
-        score = value_score(markup, w, drink_pts, weights)
+        if w.est_retail_price > 0:
+            markup = w.list_price / w.est_retail_price
+            score = value_score(markup, w, drink_pts, weights)
+        else:  # the evaluation step didn't return this wine; still list it
+            markup = score = None
         rows.append(
             {
-                "Score": round(score),
-                "Rating": rating(score),
+                "Score": round(score) if score is not None else None,
+                "Rating": rating(score) if score is not None else "❔ Not evaluated",
                 "Find": "⭐" if w.underrated else "",
                 "Wine": " ".join(x for x in (w.producer, w.name) if x).strip(),
                 "Vintage": w.vintage,
@@ -321,9 +426,10 @@ def to_frame(result: WineList, weights: dict) -> pd.DataFrame:
                 "Color": w.color,
                 "Format": w.format,
                 "List": w.list_price,
-                "Est. Retail": w.est_retail_price,
-                "Markup": round(markup, 2),
+                "Est. Retail": w.est_retail_price or None,
+                "Markup": round(markup, 2) if markup else None,
                 "Critics": w.critic_score or None,
+                "Based on": w.quality_basis,
                 "Vintage ★": "★" * w.vintage_quality if w.vintage_quality else "",
                 "Drink": f"{w.drink_from}–{w.drink_to}" if w.drink_from and w.drink_to else "",
                 "Readiness": status,
@@ -333,7 +439,9 @@ def to_frame(result: WineList, weights: dict) -> pd.DataFrame:
         )
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values(["Score", "Markup"], ascending=[False, True]).reset_index(drop=True)
+        df = df.sort_values(
+            ["Score", "Markup"], ascending=[False, True], na_position="last"
+        ).reset_index(drop=True)
     return df
 
 
@@ -408,10 +516,7 @@ if files:
     if st.button("🔍 Analyze Wine List", type="primary"):
         with st.status("Analyzing…", expanded=False) as status:
             try:
-                result, used = analyze_with_fallback(
-                    client, model, to_parts(files), PROMPT + currency_note(cur_label), status
-                )
-                result.currency = CURRENCIES[cur_label][0]
+                result, used = analyze(client, model, to_parts(files), cur_label, status)
                 st.session_state["result"] = result
                 st.session_state["files_key"] = files_key
                 st.session_state["used_model"] = used
@@ -504,6 +609,10 @@ if result and files and st.session_state.get("files_key") == (
         column_config={
             "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
             "Critics": st.column_config.NumberColumn(format="%d pts"),
+            "Based on": st.column_config.TextColumn(
+                help="This wine = known reviews · Producer = producer's usual level · "
+                "Region/style = typical for that appellation, grape and price (least certain)"
+            ),
             "List": st.column_config.NumberColumn(format=f"{cur}%.0f"),
             "Est. Retail": st.column_config.NumberColumn(format=f"{cur}%.0f"),
             "Markup": st.column_config.NumberColumn(format="%.2f×"),
@@ -517,7 +626,8 @@ if result and files and st.session_state.get("files_key") == (
         "Value Score (0–100) blends price vs. retail, critic standing, drinking window and vintage "
         "quality using the weights above. 💎 75+ · 👍 60–74 · 😐 45–59 · 🚩 under 45. "
         "Critic scores, vintage ratings and drinking windows are the AI's recollection of published "
-        "reviews and vintage charts, not a live lookup. Typical restaurant markup is 2.5–3×. "
+        "reviews and vintage charts, not a live lookup. "
+        "'Based on' shows how specific each estimate is. Typical restaurant markup is 2.5–3×. "
         "Low-confidence price estimates are excluded from picks. "
         f"Model: {st.session_state.get('used_model', model)} via {backend}"
     )
