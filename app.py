@@ -931,15 +931,39 @@ with st.sidebar:
     )
 
 img_types = ["jpg", "jpeg", "png", "webp"] + (["heic", "heif"] if HEIC_OK else [])
+class Shot(io.BytesIO):
+    """A camera photo kept in session state, shaped like an uploaded file."""
+
+    def __init__(self, data: bytes, n: int):
+        super().__init__(data)
+        self.name, self.size = f"camera-page-{n}.jpg", len(data)
+
+
 tab_upload, tab_camera = st.tabs(["📄 Upload photos / PDF", "📷 Use camera"])
 with tab_upload:
     uploads = st.file_uploader(
-        "Wine list pages", type=img_types + ["pdf"], accept_multiple_files=True
+        "Wine list pages (add one photo per page, or a PDF)",
+        type=img_types + ["pdf"], accept_multiple_files=True,
+        help="On a phone, tap Browse files → Take Photo, then + to add the next page.",
     )
 with tab_camera:
-    snap = st.camera_input("Take a photo of the list")
+    shots: list[bytes] = st.session_state.setdefault("shots", [])
+    snap = st.camera_input(f"Photograph page {len(shots) + 1} of the list")
+    # Each new photo is added as another page. Remember the last one seen so "Start over"
+    # doesn't re-add the photo still showing in the camera widget.
+    if snap is not None and snap.file_id != st.session_state.get("last_snap"):
+        st.session_state["last_snap"] = snap.file_id
+        shots.append(snap.getvalue())
+    if shots:
+        st.success(
+            f"📸 {len(shots)} page(s) captured. For the next page, tap **Clear photo** above "
+            "and take another."
+        )
+        if st.button("🗑️ Start over (remove captured pages)"):
+            st.session_state["shots"] = []
+            st.rerun()
 
-files = list(uploads or []) + ([snap] if snap else [])
+files = list(uploads or []) + [Shot(d, i + 1) for i, d in enumerate(st.session_state.get("shots", []))]
 files_key = None
 
 if files:
