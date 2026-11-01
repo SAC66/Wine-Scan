@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +26,10 @@ st.set_page_config(page_title="Wine List Value Scanner", page_icon="🍷", layou
 MAX_IMAGE_SIDE = 2400  # downscale big phone photos; plenty for reading a menu
 THIS_YEAR = date.today().year
 # Default importance of each factor in the overall Value Score (user can change these)
-DEFAULT_WEIGHTS = {"Price vs. retail": 35, "Critic standing": 30, "Drinking window": 20, "Vintage quality": 15}
+DEFAULT_WEIGHTS = {
+    "Price vs. retail": 35, "Critic standing": 30, "Drinking window": 20,
+    "Vintage quality": 15, "My taste": 25,
+}
 # Tried in order if the key can't list models (or the listed pick fails)
 # Lighter models are a last resort for analysis when Google's main models are overloaded
 EXTRA_ANALYSIS_FALLBACKS = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite"]
@@ -55,11 +59,12 @@ class Evaluation(BaseModel):
     est_retail_price: float = Field(description="Typical retail shop price for this bottle and vintage, number only")
     retail_confidence: str = Field(description="High, Medium or Low")
     critic_score: int = Field(description="Estimated professional critic score, 100-point scale. Never 0")
-    quality_basis: str = Field(description="Exactly one of: 'This wine', 'Producer', 'Region/style'")
+    quality_basis: str = Field(description="Exactly one of: 'Web reviews', 'This wine', 'Producer', 'Region/style'")
     vintage_quality: int = Field(description="Vintage quality for this region, 1 (poor) to 5 (outstanding); 0 only for NV")
     drink_from: int = Field(description="First year of the drinking window. Never 0")
     drink_to: int = Field(description="Last year of the drinking window. Never 0")
     underrated: bool = Field(description="True only for genuine sommelier finds")
+    taste_match: int = Field(description="How well it fits the diner's stated preferences, 1 (poor) to 5 (perfect); 0 if no preferences were given")
     note: str = Field(description="One short, specific sentence")
 
 
@@ -76,6 +81,7 @@ class Wine(ListedWine):
     drink_from: int = 0
     drink_to: int = 0
     underrated: bool = False
+    taste_match: int = 0
     note: str = ""
 
 
@@ -83,6 +89,7 @@ class WineList(BaseModel):
     currency: str
     restaurant: str
     wines: list[Wine]
+    sources: list[tuple[str, str]] = []  # (title, url) of web pages Google Search used
 
 
 # label -> (symbol, currency name, retail market to price against)
@@ -133,12 +140,34 @@ For EVERY wine below, return an evaluation with the same id. Do not skip any.
 - underrated: true only for genuine sommelier finds: lesser-known regions, grapes or
   producers that over-deliver, grower Champagne, well-aged back-vintages priced
   modestly, etc. Most wines should be false.
-- note: one short, specific sentence weighing price, quality and readiness.
+- taste_match: 0 unless the diner's preferences are given below; then 1-5 for how well
+  the wine fits them.
+- note: one short, specific sentence weighing price, quality and readiness (and the
+  diner's taste, if given).
 
 Wines (id | wine | list price):
 """
 
 EVAL_PROMPT = EVAL_TEMPLATE.replace("{year}", str(THIS_YEAR))
+
+SEARCH_NOTE = """
+Use Google Search to look up critic reviews/scores, vintage reports and typical retail
+prices for these wines (e.g. Wine-Searcher, Vinous, Wine Spectator, Decanter,
+JancisRobinson.com, CellarTracker). When a score comes from what you found, set
+quality_basis to 'Web reviews'. Don't spend searches on wines you already know well.
+
+Return ONLY a JSON object, no other text, in exactly this shape:
+{"evaluations": [{"id": 0, "est_retail_price": 0.0, "retail_confidence": "Medium",
+  "critic_score": 90, "quality_basis": "Web reviews", "vintage_quality": 4,
+  "drink_from": 2024, "drink_to": 2032, "underrated": false, "taste_match": 0,
+  "note": "..."}]}
+"""
+
+
+def prefs_note(prefs: str) -> str:
+    if not prefs.strip():
+        return ""
+    return f"\nThe diner's preferences (use them for taste_match and the note):\n{prefs.strip()}\n"
 
 
 # ---------------------------------------------------------------- helpers
@@ -254,6 +283,7 @@ def to_parts(files) -> list[types.Part]:
 
 
 EVAL_BATCH = 15  # wines per evaluation request: small enough that every wine gets attention
+SEARCH_BATCH = 8  # smaller batches when searching, so each wine actually gets looked up
 
 
 def generate_json(client, model: str, contents, schema):
@@ -273,6 +303,38 @@ def generate_json(client, model: str, contents, schema):
     if resp.parsed is not None:
         return resp.parsed
     return schema.model_validate_json(resp.text)
+
+
+def generate_json_searched(client, model: str, contents, schema):
+    """Same as generate_json but lets Gemini use Google Search first.
+
+    Search can't be combined with forced-JSON mode on every model, so ask for JSON in the
+    prompt and pull it out of the text. Returns (result, [(title, url), ...]).
+    """
+    resp = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            temperature=0.2,
+            http_options=types.HttpOptions(
+                timeout=240_000, retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        ),
+    )
+    text = resp.text or ""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("Search answer contained no JSON")
+    result = schema.model_validate(json.loads(text[start : end + 1]))
+    sources = []
+    try:
+        for chunk in resp.candidates[0].grounding_metadata.grounding_chunks or []:
+            if chunk.web and chunk.web.uri:
+                sources.append((chunk.web.title or chunk.web.domain or "source", chunk.web.uri))
+    except (AttributeError, IndexError, TypeError):
+        pass
+    return result, sources
 
 
 def is_busy_or_missing(msg: str) -> bool:
@@ -303,7 +365,7 @@ def describe(w: ListedWine) -> str:
     return " · ".join(b for b in bits if b) + fmt
 
 
-def analyze(client, model: str, parts, cur_label: str, status) -> tuple[WineList, str]:
+def analyze(client, model: str, parts, cur_label: str, prefs: str, use_search: bool, status) -> tuple[WineList, str]:
     """Step 1: read the list. Step 2: evaluate it in batches (in parallel)."""
     models = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
     sym = CURRENCIES[cur_label][0]
@@ -317,17 +379,33 @@ def analyze(client, model: str, parts, cur_label: str, status) -> tuple[WineList
 
     # Keep using whichever model worked, with the others as backups
     models = [used, *[m for m in models if m != used]]
-    batches = [list(range(i, min(i + EVAL_BATCH, len(wines)))) for i in range(0, len(wines), EVAL_BATCH)]
+    size = SEARCH_BATCH if use_search else EVAL_BATCH
+    batches = [list(range(i, min(i + size, len(wines)))) for i in range(0, len(wines), size)]
     evals: dict[int, Evaluation] = {}
     messages: list[str] = []
+    sources: dict[str, str] = {}
+    search_ok = [use_search]  # flips off for the rest of the scan if search stops working
 
     def run_batch(ids):
         lines = "\n".join(f"{i} | {describe(wines[i])} | {sym}{wines[i].list_price:g}" for i in ids)
-        prompt = EVAL_PROMPT + lines + "\n" + currency_note(cur_label)
+        prompt = EVAL_PROMPT + lines + "\n" + currency_note(cur_label) + prefs_note(prefs)
+        if search_ok[0]:
+            for m in models[:2]:
+                try:
+                    out, found = generate_json_searched(client, m, prompt + SEARCH_NOTE, Evaluations)
+                    for title, url in found:
+                        sources.setdefault(url, title)
+                    return out.evaluations
+                except Exception as e:
+                    err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err or "search" in err.lower():
+                search_ok[0] = False  # quota used up or not supported: stop trying
+            messages.append(f"🔎 Web search unavailable for some wines, used built-in knowledge instead ({err[:120]})")
         out, _ = with_fallback(client, models, prompt, Evaluations, messages.append)
         return out.evaluations
 
-    status.update(label=f"Step 2 of 2: evaluating {len(wines)} wines… (30–90 s)")
+    how = "checking reviews online" if use_search else "evaluating"
+    status.update(label=f"Step 2 of 2: {how} for {len(wines)} wines… (1–3 min)")
     done = 0
     with ThreadPoolExecutor(max_workers=3) as pool:  # modest parallelism for free-tier rate limits
         futures = [pool.submit(run_batch, ids) for ids in batches]
@@ -359,7 +437,10 @@ def analyze(client, model: str, parts, cur_label: str, status) -> tuple[WineList
         e = evals.get(i)
         extra = e.model_dump(exclude={"id"}) if e else {}
         merged.append(Wine(**w.model_dump(), **extra))
-    return WineList(currency=sym, restaurant=listed.restaurant, wines=merged), used
+    return WineList(
+        currency=sym, restaurant=listed.restaurant, wines=merged,
+        sources=[(t, u) for u, t in sources.items()],
+    ), used
 
 
 def _clamp01(x: float) -> float:
@@ -388,9 +469,11 @@ def value_score(markup: float, w: Wine, drink_pts: float, weights: dict) -> floa
         "Critic standing": 100 * _clamp01((w.critic_score - 84) / 12) if w.critic_score else 50.0,  # 84 → 0, 96 → 100
         "Drinking window": drink_pts,
         "Vintage quality": 25 * (w.vintage_quality - 1) if w.vintage_quality else 60.0,
+        "My taste": 25 * (w.taste_match - 1) if w.taste_match else None,  # None: no preferences given
     }
-    total = sum(weights.values()) or 1
-    return sum(parts[k] * weights.get(k, 0) for k in parts) / total
+    used = {k: v for k, v in parts.items() if v is not None}
+    total = sum(weights.get(k, 0) for k in used) or 1
+    return sum(v * weights.get(k, 0) for k, v in used.items()) / total
 
 
 def rating(score: float) -> str:
@@ -430,6 +513,7 @@ def to_frame(result: WineList, weights: dict) -> pd.DataFrame:
                 "Markup": round(markup, 2) if markup else None,
                 "Critics": w.critic_score or None,
                 "Based on": w.quality_basis,
+                "Taste": "♥" * w.taste_match if w.taste_match else "",
                 "Vintage ★": "★" * w.vintage_quality if w.vintage_quality else "",
                 "Drink": f"{w.drink_from}–{w.drink_to}" if w.drink_from and w.drink_to else "",
                 "Readiness": status,
@@ -479,6 +563,33 @@ except Exception as e:
         st.code(str(e))
     st.stop()
 
+# --- sidebar: the diner's taste and search setting
+with st.sidebar:
+    st.header("🍷 My taste")
+    default_prefs = st.query_params.get("taste") or get_secret("MY_PREFERENCES", "") or ""
+    prefs = st.text_area(
+        "What do you like and dislike?",
+        value=default_prefs,
+        height=160,
+        placeholder="e.g. Love Northern Rhône Syrah, Barolo and dry Riesling. Prefer old-world, "
+        "earthy, high-acid wines. Avoid oaky buttery Chardonnay and jammy Zinfandel.",
+        help="Used to give each wine a 'My taste' match (1–5 ♥) that feeds the Value Score.",
+    )
+    if prefs.strip() != (st.query_params.get("taste") or "").strip():
+        if prefs.strip():
+            st.query_params["taste"] = prefs.strip()  # bookmark the page to keep your taste
+        elif "taste" in st.query_params:
+            del st.query_params["taste"]
+    st.caption("💡 Bookmark this page after typing: your taste is saved in the link.")
+    st.divider()
+    use_search = st.toggle(
+        "🔎 Check reviews online (Google Search)",
+        value=True,
+        help="Looks up critic reviews, vintage reports and shop prices on the web. More accurate "
+        "but slower (1–3 min). Free Gemini keys get a limited number of searches per day; if "
+        "they run out, the app falls back to the AI's own knowledge.",
+    )
+
 img_types = ["jpg", "jpeg", "png", "webp"] + (["heic", "heif"] if HEIC_OK else [])
 tab_upload, tab_camera = st.tabs(["📄 Upload photos / PDF", "📷 Use camera"])
 with tab_upload:
@@ -512,11 +623,13 @@ if files:
         key="currency",
         help="Retail prices are estimated for this country, so pick where the restaurant is.",
     )
-    files_key = (tuple((f.name, f.size) for f in files), cur_label)
+    files_key = (tuple((f.name, f.size) for f in files), cur_label, prefs.strip(), use_search)
     if st.button("🔍 Analyze Wine List", type="primary"):
         with st.status("Analyzing…", expanded=False) as status:
             try:
-                result, used = analyze(client, model, to_parts(files), cur_label, status)
+                result, used = analyze(
+                    client, model, to_parts(files), cur_label, prefs, use_search, status
+                )
                 st.session_state["result"] = result
                 st.session_state["files_key"] = files_key
                 st.session_state["used_model"] = used
@@ -539,20 +652,28 @@ if files:
                 st.stop()
 
 result = st.session_state.get("result")
-if result and files and st.session_state.get("files_key") == (
+current_key = (
     tuple((f.name, f.size) for f in files),
     st.session_state.get("currency"),
-):
+    prefs.strip(),
+    use_search,
+)
+if result and files and st.session_state.get("files_key") != current_key:
+    if st.session_state.get("files_key", (None,))[0] == current_key[0]:
+        st.info("Settings changed. Press **Analyze Wine List** again to update the results.")
+elif result and files:
     with st.expander("⚖️ What matters to you? Adjust how the Value Score is weighted"):
-        wcols = st.columns(len(DEFAULT_WEIGHTS))
+        has_taste = any(w.taste_match for w in result.wines)
+        factors = {k: v for k, v in DEFAULT_WEIGHTS.items() if has_taste or k != "My taste"}
+        wcols = st.columns(len(factors))
         weights = {
             k: wc.slider(k, 0, 100, v, step=5, key=f"w_{k}")
-            for wc, (k, v) in zip(wcols, DEFAULT_WEIGHTS.items())
+            for wc, (k, v) in zip(wcols, factors.items())
         }
         st.caption(
             "Price vs. retail: restaurant markup over shop price · Critic standing: typical "
             "professional score · Drinking window: is it ready to drink now · Vintage quality: "
-            "how good the year was in that region."
+            "how good the year was in that region · My taste: fit with the preferences in the sidebar."
         )
     df = to_frame(result, weights)
     cur = result.currency or "$"
@@ -596,6 +717,7 @@ if result and files and st.session_state.get("files_key") == (
                     f"~{w['Critics']:.0f} pts" if pd.notna(w["Critics"]) else "",
                     f"vintage {w['Vintage ★']}" if w["Vintage ★"] else "",
                     f"{w['Readiness']} ({w['Drink']})" if w["Drink"] else w["Readiness"],
+                    f"taste {w['Taste']}" if w["Taste"] else "",
                 ]
                 st.markdown(" · ".join(d for d in details if d))
                 st.caption(("⭐ Underrated find. " if w["Find"] else "") + w["Note"])
@@ -610,7 +732,7 @@ if result and files and st.session_state.get("files_key") == (
             "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
             "Critics": st.column_config.NumberColumn(format="%d pts"),
             "Based on": st.column_config.TextColumn(
-                help="This wine = known reviews · Producer = producer's usual level · "
+                help="Web reviews = found via Google Search · This wine = known reviews · Producer = producer's usual level · "
                 "Region/style = typical for that appellation, grape and price (least certain)"
             ),
             "List": st.column_config.NumberColumn(format=f"{cur}%.0f"),
@@ -619,15 +741,23 @@ if result and files and st.session_state.get("files_key") == (
             "Note": st.column_config.TextColumn(width="large"),
         },
     )
+    if result.sources:
+        with st.expander(f"🔎 Web sources checked ({len(result.sources)})"):
+            st.markdown("\n".join(f"- [{t}]({u})" for t, u in result.sources[:60]))
     st.download_button(
         "⬇️ Download CSV", view.to_csv(index=False), "wine_list_analysis.csv", "text/csv"
     )
     st.caption(
-        "Value Score (0–100) blends price vs. retail, critic standing, drinking window and vintage "
-        "quality using the weights above. 💎 75+ · 👍 60–74 · 😐 45–59 · 🚩 under 45. "
-        "Critic scores, vintage ratings and drinking windows are the AI's recollection of published "
-        "reviews and vintage charts, not a live lookup. "
-        "'Based on' shows how specific each estimate is. Typical restaurant markup is 2.5–3×. "
+        "Value Score (0–100) blends price vs. retail, critic standing, drinking window, vintage "
+        "quality and your taste using the weights above. 💎 75+ · 👍 60–74 · 😐 45–59 · 🚩 under 45. "
+        + (
+            "Scores marked 'Web reviews' were checked with Google Search; the rest are the AI's own "
+            "knowledge of reviews and vintage charts. "
+            if result.sources
+            else "Critic scores, vintage ratings and drinking windows are the AI's recollection of "
+            "published reviews and vintage charts, not a live lookup. "
+        )
+        + "'Based on' shows how specific each estimate is. Typical restaurant markup is 2.5–3×. "
         "Low-confidence price estimates are excluded from picks. "
         f"Model: {st.session_state.get('used_model', model)} via {backend}"
     )
