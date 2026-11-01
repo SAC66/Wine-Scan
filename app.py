@@ -876,7 +876,29 @@ st.caption(
     "values and under-the-radar bottles. Retail prices are AI estimates. Use them as a guide, not gospel."
 )
 
-api_key = get_secret("GEMINI_API_KEY")
+def user_key(code: str) -> str | None:
+    """Look up a friend's Gemini key by the code in their link (?u=CODE).
+
+    Keys live in Secrets under [USER_KEYS], so the link only carries a made-up code,
+    never the key itself.
+    """
+    try:
+        keys = st.secrets.get("USER_KEYS", {})
+        key = keys.get(code)
+        return str(key).strip().strip("\"'") if key else None
+    except Exception:
+        return None
+
+
+user_code = (st.query_params.get("u") or "").strip()
+if user_code:
+    api_key = user_key(user_code)
+    if not api_key:
+        # Never fall back to the owner's key for a shared link
+        st.error("This link isn't set up (unknown code). Ask whoever sent it for a new link.")
+        st.stop()
+else:
+    api_key = get_secret("GEMINI_API_KEY")
 if not api_key:
     st.error(
         "No `GEMINI_API_KEY` found. On Streamlit Community Cloud, add it under **App → Settings → Secrets**:\n\n"
