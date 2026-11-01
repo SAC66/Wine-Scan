@@ -4,3 +4,4 @@ Pillow
 pillow-heif
 pandas
 pydantic>=2
+pypdf
