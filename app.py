@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -78,6 +79,9 @@ class QuickEstimate(BaseModel):
     id: int
     retail: float = Field(description="Typical retail shop price, number only")
     critic: int = Field(description="Typical critic score, 100-point scale, never 0")
+    vintage: int = Field(description="Vintage quality for the region, 1-5; 0 only for NV")
+    drink_from: int = Field(description="First year of the drinking window")
+    drink_to: int = Field(description="Last year of the drinking window")
 
 
 class QuickEstimates(BaseModel):
@@ -102,6 +106,7 @@ class WineList(BaseModel):
     restaurant: str
     wines: list[Wine]
     sources: list[tuple[str, str]] = []  # (title, url) of web pages Google Search used
+    warnings: list[str] = []  # problems worth showing with the results
     total_listed: int = 0  # wines on the whole list
     researched: int = 0  # wines that got the full (deep) evaluation
 
@@ -414,7 +419,7 @@ def size_label(ml: int) -> str:
 
 
 EVAL_BATCH = 15  # wines per evaluation request: small enough that every wine gets attention
-TRIAGE_BATCH = 120  # wines per quick-estimate request (big lists only)
+TRIAGE_BATCH = 100  # wines per quick-estimate request (big lists only)
 COLORS = ["Red", "White", "Sparkling", "Rosé", "Orange", "Dessert"]
 
 TRIAGE_TEMPLATE = """You are an expert sommelier and wine-pricing analyst. It is now {year}.
@@ -423,6 +428,9 @@ For EVERY wine below give, quickly and from your own knowledge:
 - critic: the typical professional critic score (100-point scale). If you don't know
   the exact wine, use the producer's usual level, else what that appellation, vintage
   and price tier typically scores. Never 0.
+- vintage: how good that vintage was in that region, 1 (poor) to 5 (outstanding); 0 for NV
+- drink_from / drink_to: the drinking window in years (use the norms for the style,
+  region and quality level if you don't know the wine)
 Return one estimate per wine, using the same id.
 
 Wines (id | wine):
@@ -488,18 +496,40 @@ def is_busy_or_missing(msg: str) -> bool:
     return any(k.lower() in msg.lower() for k in keys)
 
 
+def rate_limit_wait(msg: str) -> float | None:
+    """Seconds to wait if this is a per-minute rate limit (worth waiting out), else None.
+
+    The free plan allows only a few requests per minute; Google says how long to wait
+    ("retryDelay": "23s" / "retry in 23.4s"). Daily quotas aren't worth waiting for.
+    """
+    if not ("429" in msg or "RESOURCE_EXHAUSTED" in msg) or "PerDay" in msg or "per day" in msg.lower():
+        return None
+    m = re.search(r"retry(?:Delay)?\D{0,6}(\d+(?:\.\d+)?)\s*s", msg, re.I)
+    return min(float(m.group(1)) + 1, 45) if m else 20
+
+
 def with_fallback(client, models: list[str], contents, schema, log):
-    """Try each model in turn so one overloaded model doesn't sink the scan. Returns (result, model)."""
+    """Try each model in turn so one overloaded model doesn't sink the scan. Returns (result, model).
+
+    Per-minute rate limits are waited out (twice) before moving to the next model.
+    """
     errors = []
     for m in models:
-        try:
-            return generate_json(client, m, contents, schema), m
-        except Exception as e:
-            msg = str(e)
-            if not is_busy_or_missing(msg):
-                raise
-            errors.append(f"{m}: {msg}")
-            log(f"⏭️ {m} is busy or unavailable, trying another model…")
+        for attempt in range(3):
+            try:
+                return generate_json(client, m, contents, schema), m
+            except Exception as e:
+                msg = str(e)
+                if not is_busy_or_missing(msg):
+                    raise
+                wait = rate_limit_wait(msg)
+                if wait and attempt < 2:
+                    log(f"⏳ Google's free-plan speed limit reached, waiting {wait:.0f}s…")
+                    time.sleep(wait)
+                    continue
+                errors.append(f"{m}: {msg}")
+                log(f"⏭️ {m} is busy or unavailable, trying another model…")
+                break
     raise RuntimeError("ALL_BUSY\n\n" + "\n\n".join(errors))
 
 
@@ -541,7 +571,7 @@ def read_wines(client, models, files, status) -> tuple[str, list[ListedWine], st
         used_models.append(m)
         return out
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {pool.submit(read_chunk, parts): i for i, (_, parts) in enumerate(ai_chunks)}
         for fut in as_completed(futures):
             i = futures[fut]
@@ -619,7 +649,7 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
             return out.estimates
 
         done = 0
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             for fut in as_completed([pool.submit(run_quick, ids) for ids in batches]):
                 try:
                     for q in fut.result():
@@ -630,13 +660,25 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
                 done += 1
                 status.update(label=f"Step 2: quick check {done}/{len(batches)} batches…")
 
+        missed = [i for i in range(len(wines)) if i not in quick]
+        if missed and quick:
+            status.update(label=f"Step 2: second try for {len(missed)} wines…")
+            for ids in [missed[i : i + TRIAGE_BATCH] for i in range(0, len(missed), TRIAGE_BATCH)]:
+                try:
+                    for q in run_quick(ids):
+                        if 0 <= q.id < len(wines):
+                            quick[q.id] = q
+                except Exception as e:
+                    messages.append(f"⚠️ Quick-check retry failed: {str(e)[:150]}")
+
         def prelim(i):
             q = quick.get(i)
             if not q or q.retail <= 0:
                 return -1
             markup_pts = 100 * _clamp01((4.0 - wines[i].list_price / q.retail) / 2.5)
             critic_pts = 100 * _clamp01((q.critic - 84) / 12)
-            return 0.55 * markup_pts + 0.45 * critic_pts
+            _, drink_pts = drink_status(Wine(**wines[i].model_dump(), drink_from=q.drink_from, drink_to=q.drink_to))
+            return 0.45 * markup_pts + 0.35 * critic_pts + 0.20 * drink_pts
 
         deep_ids = sorted(quick, key=prelim, reverse=True)[: scope["deep_n"]]
         status.write(f"🔬 Researching the top {len(deep_ids)} candidates in depth")
@@ -652,15 +694,21 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
         prompt = EVAL_PROMPT + "\n".join(line(i) for i in ids) + "\n" + notes + prefs_note(prefs)
         if search_ok[0]:
             for m in models[:2]:
-                try:
-                    out, found = generate_json_searched(client, m, prompt + SEARCH_NOTE, Evaluations)
-                    for title, url in found:
-                        sources.setdefault(url, title)
-                    return out.evaluations
-                except Exception as e:
-                    err = str(e)
-            if "429" in err or "RESOURCE_EXHAUSTED" in err or "search" in err.lower():
-                search_ok[0] = False  # quota used up or not supported: stop trying
+                for attempt in range(2):
+                    try:
+                        out, found = generate_json_searched(client, m, prompt + SEARCH_NOTE, Evaluations)
+                        for title, url in found:
+                            sources.setdefault(url, title)
+                        return out.evaluations
+                    except Exception as e:
+                        err = str(e)
+                        wait = rate_limit_wait(err)
+                        if wait and attempt == 0:  # per-minute limit: wait it out once
+                            time.sleep(wait)
+                            continue
+                        break
+            if rate_limit_wait(err) is None and ("429" in err or "RESOURCE_EXHAUSTED" in err or "search" in err.lower()):
+                search_ok[0] = False  # daily search quota used up or not supported: stop trying
             messages.append(f"🔎 Web search unavailable for some wines, used built-in knowledge instead ({err[:120]})")
         out, _ = with_fallback(client, models, prompt, Evaluations, messages.append)
         return out.evaluations
@@ -668,7 +716,7 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
     how = "checking reviews online" if use_search else "evaluating"
     status.update(label=f"Step 3: {how} for {len(deep_ids)} wines… (1–3 min)")
     done = 0
-    with ThreadPoolExecutor(max_workers=3) as pool:  # modest parallelism for free-tier rate limits
+    with ThreadPoolExecutor(max_workers=2) as pool:  # modest parallelism for free-tier rate limits
         for fut in as_completed([pool.submit(run_batch, ids) for ids in batches]):
             try:
                 for e in fut.result():
@@ -679,25 +727,43 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
             status.update(label=f"Step 3: evaluated {done}/{len(batches)} batches…")
 
     # Re-ask once for any shortlisted wines the model skipped
+    # Second chance (one batch at a time, so it's gentle on rate limits) for anything missed
     missing = [i for i in deep_ids if i not in evals]
-    if missing and len(missing) < len(deep_ids):
-        status.write(f"🔁 Re-checking {len(missing)} wines that were skipped…")
-        try:
-            for e in run_batch(missing):
-                evals[e.id] = e
-        except Exception as e:
-            messages.append(f"⚠️ Re-check failed: {str(e)[:200]}")
+    if missing:
+        status.update(label=f"Step 3: second try for {len(missing)} wines…")
+        for ids in [missing[i : i + size] for i in range(0, len(missing), size)]:
+            try:
+                for e in run_batch(ids):
+                    evals[e.id] = e
+            except Exception as e:
+                messages.append(f"⚠️ Re-check failed: {str(e)[:200]}")
     for m in dict.fromkeys(messages):
         status.write(m)
     if not evals and not quick:
         raise RuntimeError("ALL_BUSY\n\n" + "\n".join(messages))
+
+    warnings = []
+    still = [i for i in deep_ids if i not in evals]
+    if still:
+        warnings.append(
+            f"Only {len(deep_ids) - len(still)} of the {len(deep_ids)} top candidates got the full "
+            "research (Google's free-plan limits). The rest show quick estimates. Press "
+            "**Analyze** again in a few minutes to fill them in."
+        )
+    if quick and len(quick) < len(wines) - len(evals):
+        warnings.append(
+            f"{len(wines) - len(quick)} wines couldn't be estimated at all (free-plan limits) and "
+            "show as 'Not evaluated'."
+        )
 
     merged = []
     for i, w in enumerate(wines):
         if i in evals:
             extra = evals[i].model_dump(exclude={"id"})
         elif i in quick:
-            extra = {"est_retail_price": quick[i].retail, "critic_score": quick[i].critic,
+            q = quick[i]
+            extra = {"est_retail_price": q.retail, "critic_score": q.critic,
+                     "vintage_quality": q.vintage, "drink_from": q.drink_from, "drink_to": q.drink_to,
                      "quality_basis": "Quick estimate", "retail_confidence": "Medium"}
         else:
             extra = {}
@@ -705,7 +771,7 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
     return WineList(
         currency=sym, restaurant=restaurant, wines=merged,
         sources=[(t, u) for u, t in sources.items()],
-        total_listed=total, researched=len(evals),
+        total_listed=total, researched=len(evals), warnings=warnings,
     ), used
 
 
@@ -992,6 +1058,8 @@ elif result and files:
 
     view = df[df["Color"].isin(pick_colors) & (df["List"] <= budget) & df["Size"].isin(pick_sizes)]
 
+    for w in result.warnings:
+        st.warning(w)
     near_one = df["Markup"].between(0.97, 1.03).mean()
     if near_one > 0.4:
         st.warning(
