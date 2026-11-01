@@ -15,6 +15,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from pypdf import PdfReader, PdfWriter
+from streamlit_js_eval import streamlit_js_eval
 
 try:  # iPhone photos are often HEIC; support them if pillow-heif is installed
     from pillow_heif import register_heif_opener
@@ -890,8 +891,71 @@ def user_key(code: str) -> str | None:
         return None
 
 
+KEY_STORE = "wine_scan_gemini_key"  # browser localStorage name for a friend's own key
+KEY_OK = re.compile(r"^[A-Za-z0-9._\-]{20,200}$")
+
+
+def friend_key() -> str:
+    """For ?friend links: the visitor's own Gemini key, kept only in their browser.
+
+    First visit shows a one-time setup; afterwards the key is read back from the phone's
+    local storage, so the link itself never contains a key and the owner's key is never used.
+    """
+    gen = st.session_state.setdefault("key_gen", 0)  # bumped by "Use a different key"
+    if st.session_state.get("friend_key"):
+        key = st.session_state["friend_key"]
+        if not st.session_state.get("friend_key_saved"):
+            # Runs once in the browser to remember the key on this device
+            streamlit_js_eval(
+                js_expressions=f"localStorage.setItem('{KEY_STORE}', '{key}')", key=f"save_key_{gen}"
+            )
+            st.session_state["friend_key_saved"] = True
+        return key
+    if st.session_state.get("forget_key"):
+        streamlit_js_eval(js_expressions=f"localStorage.removeItem('{KEY_STORE}')", key=f"forget_key_{gen}")
+    else:
+        stored = streamlit_js_eval(
+            js_expressions=f"localStorage.getItem('{KEY_STORE}') || ''", key="load_key"
+        )
+        if stored is None:  # the browser hasn't answered yet; the page reruns when it does
+            st.caption("Loading…")
+            st.stop()
+        if stored and KEY_OK.match(stored):
+            st.session_state["friend_key"] = st.session_state["friend_key_saved"] = stored
+            return stored
+
+    st.subheader("👋 One-time setup")
+    st.markdown(
+        "This app uses Google's Gemini AI, and each person uses their own **free** key.\n\n"
+        "1. Open **[aistudio.google.com/apikey](https://aistudio.google.com/apikey)** and sign in "
+        "with a Google account.\n"
+        "2. Tap **Create API key**, then the **copy** icon next to it.\n"
+        "3. Paste it below. It's saved only on this phone, so you won't be asked again."
+    )
+    entered = st.text_input("Your Gemini API key", type="password").strip().strip("\"'")
+    if st.button("Save and start", type="primary"):
+        if not KEY_OK.match(entered):
+            st.error("That doesn't look like an API key. Copy it again with the copy icon and paste it here.")
+        else:
+            st.session_state["friend_key"] = entered
+            st.session_state.pop("forget_key", None)
+            st.rerun()
+    st.stop()
+
+
 user_code = (st.query_params.get("u") or "").strip()
-if user_code:
+friend_mode = "friend" in st.query_params
+if friend_mode:
+    api_key = friend_key()
+    with st.sidebar:
+        st.divider()
+        if st.button("🔑 Use a different Gemini key"):
+            for k in ("friend_key", "friend_key_saved"):
+                st.session_state.pop(k, None)
+            st.session_state["forget_key"] = True
+            st.session_state["key_gen"] += 1
+            st.rerun()
+elif user_code:
     api_key = user_key(user_code)
     if not api_key:
         # Never fall back to the owner's key for a shared link
@@ -914,6 +978,15 @@ try:
         (get_secret("GEMINI_USE_VERTEX", "") or "").lower() in ("1", "true", "yes"),
     )
 except Exception as e:
+    if friend_mode:
+        st.error(
+            "Google didn't accept your Gemini key (ending in "
+            f"**…{api_key[-4:]}**). Tap **🔑 Use a different Gemini key** in the menu (top-left "
+            "**>**) and paste it again, or make a fresh one at https://aistudio.google.com/apikey."
+        )
+        with st.expander("Technical details"):
+            st.code(str(e))
+        st.stop()
     st.error(
         "Couldn't connect to Gemini with this API key. Common causes: a typo or extra quotes in "
         "the secret, the key was deleted, or the Generative Language API isn't enabled for its project. "
