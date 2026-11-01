@@ -119,8 +119,9 @@ CURRENCIES = {
 def currency_note(label: str) -> str:
     sym, name, market = CURRENCIES[label]
     return (
-        f"\nIMPORTANT: All list prices are in {name}, even if no currency symbol is printed. "
-        f"Estimate retail prices as a shopper in {market} would pay, in {name}.\n"
+        f"\nIMPORTANT: Give retail prices in {name}, as a shopper in {market} would pay at a "
+        "wine shop. Restaurant prices are deliberately not shown: estimate retail independently "
+        "from your knowledge of the wine market.\n"
     )
 
 
@@ -160,10 +161,10 @@ For EVERY wine below, return an evaluation with the same id. Do not skip any.
   modestly, etc. Most wines should be false.
 - taste_match: 0 unless the diner's preferences are given below; then 1-5 for how well
   the wine fits them.
-- note: one short, specific sentence weighing price, quality and readiness (and the
+- note: one short, specific sentence on quality, style and readiness (and the
   diner's taste, if given).
 
-Wines (id | wine | list price):
+Wines (id | wine):
 """
 
 EVAL_PROMPT = EVAL_TEMPLATE.replace("{year}", str(THIS_YEAR))
@@ -424,7 +425,7 @@ For EVERY wine below give, quickly and from your own knowledge:
   and price tier typically scores. Never 0.
 Return one estimate per wine, using the same id.
 
-Wines (id | wine | list price):
+Wines (id | wine):
 """
 SEARCH_BATCH = 8  # smaller batches when searching, so each wine actually gets looked up
 
@@ -600,7 +601,9 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
     notes = currency_note(cur_label)
 
     def line(i):
-        return f"{i} | {describe(wines[i])} | {sym}{wines[i].list_price:g}"
+        # No list price here on purpose: shown the menu price, the model tends to echo it
+        # back as the "retail" estimate, which made every markup come out at 1.0×.
+        return f"{i} | {describe(wines[i])}"
 
     # --- quick pass (big lists only): rough retail + critic score for every wine
     quick: dict[int, QuickEstimate] = {}
@@ -988,6 +991,13 @@ elif result and files:
     pick_sizes = f3.multiselect("Bottle size", sizes, default=default_sizes or sizes)
 
     view = df[df["Color"].isin(pick_colors) & (df["List"] <= budget) & df["Size"].isin(pick_sizes)]
+
+    near_one = df["Markup"].between(0.97, 1.03).mean()
+    if near_one > 0.4:
+        st.warning(
+            f"{near_one:.0%} of retail estimates came back equal to the list price, which isn't "
+            "realistic. Treat the markups as unreliable and try **Analyze** again."
+        )
 
     # --- headline metrics
     m1, m2, m3, m4 = st.columns(4)
