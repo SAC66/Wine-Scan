@@ -680,7 +680,15 @@ def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: b
             _, drink_pts = drink_status(Wine(**wines[i].model_dump(), drink_from=q.drink_from, drink_to=q.drink_to))
             return 0.45 * markup_pts + 0.35 * critic_pts + 0.20 * drink_pts
 
-        deep_ids = sorted(quick, key=prelim, reverse=True)[: scope["deep_n"]]
+        ranked = sorted(quick, key=prelim, reverse=True)
+        deep_ids = ranked[: scope["deep_n"]]
+        # Make sure each wine type and the cheaper bottles get a fair look, so the
+        # "best red / white / budget" picks are based on researched wines too.
+        cheap_cut = sorted(w.list_price for w in wines)[len(wines) // 3]
+        groups = [[i for i in ranked if wines[i].color == c] for c in {w.color for w in wines}]
+        groups.append([i for i in ranked if wines[i].list_price <= cheap_cut])
+        for group in groups:
+            deep_ids += [i for i in group[:3] if i not in deep_ids]
         status.write(f"🔬 Researching the top {len(deep_ids)} candidates in depth")
 
     # --- full evaluation of the shortlist
@@ -975,7 +983,7 @@ if files:
             key="scope_small",
         )
         deep_n = st.slider(
-            "How many top candidates to research in depth", 10, 100, 40, step=10, key="scope_deep",
+            "How many top candidates to research in depth", 5, 60, 20, step=5, key="scope_deep",
             help="Big lists get a quick price & critic check for every wine, then only the most "
             "promising ones get the full treatment (web reviews, drinking window, your taste). "
             "Higher = more thorough but slower and uses more of your free Gemini quota.",
@@ -1074,27 +1082,48 @@ elif result and files:
     m3.metric("Great buys", int((df["Score"] >= 75).sum()))
     m4.metric("Drinking well now", int((df["Readiness"] == "🟢 Drinking well").sum()))
 
-    # --- top picks
-    picks = view[
-        (view["Confidence"] != "Low") & (view["Score"] >= 60) & (view["Based on"] != "Quick estimate")
-    ].head(3)
-    if not picks.empty:
-        st.markdown("#### 🏆 Sommelier's picks")
-        for col, (_, w) in zip(st.columns(len(picks)), picks.iterrows()):
-            with col.container(border=True):
-                st.markdown(f"**{w['Wine']} {w['Vintage']}**  \n{w['Region']}")
-                st.markdown(
-                    f"**Value Score {w['Score']}** · {cur}{w['List']:,.0f} on list · "
-                    f"~{cur}{w['Est. Retail']:,.0f} retail ({w['Markup']:.1f}×)"
-                )
-                details = [
-                    f"~{w['Critics']:.0f} pts" if pd.notna(w["Critics"]) else "",
-                    f"vintage {w['Vintage ★']}" if w["Vintage ★"] else "",
-                    f"{w['Readiness']} ({w['Drink']})" if w["Drink"] else w["Readiness"],
-                    f"taste {w['Taste']}" if w["Taste"] else "",
-                ]
-                st.markdown(" · ".join(d for d in details if d))
-                st.caption(("⭐ Underrated find. " if w["Find"] else "") + w["Note"])
+    # --- at-the-table picks: one clear answer per need
+    pool = view[(view["Confidence"] != "Low") & (view["Based on"] != "Quick estimate") & view["Score"].notna()]
+    if pool.empty:
+        pool = view[view["Score"].notna()]
+    chosen: list[tuple[str, pd.Series]] = []
+
+    def take(title, candidates):
+        candidates = candidates[~candidates.index.isin([w.name for _, w in chosen])]
+        if not candidates.empty and candidates.iloc[0]["Score"] >= 50:
+            chosen.append((title, candidates.iloc[0]))
+
+    take("🏆 Best overall", pool)
+    if len(pool) > 3:
+        take("💰 Best budget bottle", pool[pool["List"] <= pool["List"].quantile(0.33)])
+    for color, icon in (("Red", "🍷"), ("White", "🥂"), ("Sparkling", "🍾")):
+        if color in pool["Color"].values and color in pick_colors and len(pick_colors) > 1:
+            take(f"{icon} Best {color.lower()}", pool[pool["Color"] == color])
+
+    if chosen:
+        st.markdown("#### Our picks")
+        for row in range(0, len(chosen), 2):
+            cols = st.columns(2)
+            for col, (title, w) in zip(cols, chosen[row : row + 2]):
+                with col.container(border=True):
+                    st.markdown(f"**{title}**")
+                    st.markdown(f"### {cur}{w['List']:,.0f} · {w['Wine']} {w['Vintage']}")
+                    st.caption(w["Region"])
+                    st.markdown(
+                        f"{w['Rating']} (score {w['Score']:.0f}) · ~{cur}{w['Est. Retail']:,.0f} in shops "
+                        f"({w['Markup']:.1f}× markup)"
+                    )
+                    details = [
+                        f"~{w['Critics']:.0f} pts" if pd.notna(w["Critics"]) else "",
+                        f"vintage {w['Vintage ★']}" if w["Vintage ★"] else "",
+                        w["Readiness"],
+                        f"your taste {w['Taste']}" if w["Taste"] else "",
+                    ]
+                    st.markdown(" · ".join(d for d in details if d))
+                    if w["Note"] or w["Find"]:
+                        st.caption(("⭐ Underrated find. " if w["Find"] else "") + w["Note"])
+    else:
+        st.info("No wine stood out as a clear value here. Check the table below.")
 
     # --- full table
     st.markdown("#### All wines (best overall value first)")
