@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
@@ -73,6 +74,16 @@ class Evaluations(BaseModel):
     evaluations: list[Evaluation]
 
 
+class QuickEstimate(BaseModel):
+    id: int
+    retail: float = Field(description="Typical retail shop price, number only")
+    critic: int = Field(description="Typical critic score, 100-point scale, never 0")
+
+
+class QuickEstimates(BaseModel):
+    estimates: list[QuickEstimate]
+
+
 class Wine(ListedWine):
     est_retail_price: float = 0
     retail_confidence: str = "Low"
@@ -91,6 +102,8 @@ class WineList(BaseModel):
     restaurant: str
     wines: list[Wine]
     sources: list[tuple[str, str]] = []  # (title, url) of web pages Google Search used
+    total_listed: int = 0  # wines on the whole list
+    researched: int = 0  # wines that got the full (deep) evaluation
 
 
 # label -> (symbol, currency name, retail market to price against)
@@ -299,21 +312,6 @@ def split_pdf(data: bytes) -> list[tuple[str, bytes]]:
         return [("whole PDF", data)]
 
 
-def to_chunks(files) -> list[tuple[str, list[types.Part]]]:
-    """Each chunk is read separately: one photo, or a couple of PDF pages."""
-    chunks = []
-    for f in files:
-        data = f.getvalue()
-        if f.name.lower().endswith(".pdf"):
-            # Send PDF pages themselves — Gemini reads layout and scanned pages, unlike text extraction.
-            for label, pdf in split_pdf(data):
-                part = types.Part.from_bytes(data=pdf, mime_type="application/pdf")
-                chunks.append((f"{f.name} {label}", [part]))
-        else:
-            chunks.append((f.name, [prepare_image(data)]))
-    return chunks
-
-
 def size_ml(fmt: str) -> int:
     """'375ml' -> 375, '1.5L' -> 1500, 'Magnum' -> 1500, 'Glass' -> 0; default 750."""
     f = (fmt or "").lower().replace(" ", "")
@@ -330,6 +328,78 @@ def size_ml(fmt: str) -> int:
     return int(n * {"ml": 1, "cl": 10, "l": 1000}[m.group(2)])
 
 
+PRICED_LINE = re.compile(r"^(?P<body>.*?\S)\s+\$?(?P<price>\d{1,3}(?:,\d{3})+|\d{2,6})(?:\.\d{2})?\s*$")
+VINTAGE_START = re.compile(r"^(?P<v>NV|N\.V\.|(?:19|20)\d{2})\b[\s,]*(?P<rest>.+)$", re.I)
+SIZE_NOTE = re.compile(r"\((\d+(?:\.\d+)?)\s*(ml|cl|l)\)", re.I)
+
+
+def color_of(heading: str) -> str:
+    t = heading.lower()
+    if any(k in t for k in ("sweet", "fortif", "dessert")):
+        return "Dessert"
+    if any(k in t for k in ("rosé", "rose ", "skin", "orange")):
+        return "Rosé"
+    if "red" in t:
+        return "Red"
+    if "white" in t:
+        return "White"
+    if "sparkling" in t or "champagne" in t:
+        return "Sparkling"
+    return ""
+
+
+def parse_pdf_text(data: bytes) -> tuple[list[ListedWine], int]:
+    """Read a text-based PDF list locally (instant, free, no page limits).
+
+    Handles the common layout "VINTAGE Producer, Wine, Appellation ... PRICE", using each
+    page's heading for color/region ("Red Wines of Piedmont", "Half Bottles | ...") and
+    all-caps lines as sub-sections. Returns (wines, number_of_priced_lines) so the caller
+    can tell whether this layout fits; scanned PDFs return ([], 0).
+    """
+    reader = PdfReader(io.BytesIO(data))
+    wines, priced = [], 0
+    for page in reader.pages:
+        text = unicodedata.normalize("NFKC", page.extract_text() or "")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        heading = "" if PRICED_LINE.match(lines[0]) else lines[0]
+        half = "half bottle" in heading.lower()
+        color = color_of(heading)
+        region = re.sub(r"^.*?\bof\b\s*", "", heading.split("|")[-1]).strip(" |")
+        section = ""
+        for line in lines[1:]:
+            m = PRICED_LINE.match(line)
+            if not m:
+                if line.isupper() and len(line) < 60:  # e.g. "BAROLO", "CHENIN BLANC & BLENDS"
+                    section = line.title()
+                continue
+            priced += 1
+            v = VINTAGE_START.match(m.group("body"))
+            if not v:
+                continue
+            body = v.group("rest")
+            ml = 375 if half else 750
+            sz = SIZE_NOTE.search(body)
+            if sz:
+                ml = int(float(sz.group(1)) * {"ml": 1, "cl": 10, "l": 1000}[sz.group(2).lower()])
+            body = SIZE_NOTE.sub("", body)
+            body = re.sub(r"\(\d{1,2}\.\d{2}\)", "", body)  # disgorgement dates like (7.21)
+            body = re.sub(r"\s{2,}", " ", body).strip(" ,")
+            producer, _, name = body.partition(",")
+            wines.append(ListedWine(
+                producer=producer.strip(),
+                name=name.strip(),
+                vintage="NV" if v.group("v").upper().startswith("N") else v.group("v"),
+                region=", ".join(x for x in (section, region) if x),
+                grape="",
+                color=color,
+                format=f"{ml}ml",
+                list_price=float(m.group("price").replace(",", "")),
+            ))
+    return wines, priced
+
+
 def size_label(ml: int) -> str:
     if ml == 0:
         return "Glass"
@@ -343,6 +413,19 @@ def size_label(ml: int) -> str:
 
 
 EVAL_BATCH = 15  # wines per evaluation request: small enough that every wine gets attention
+TRIAGE_BATCH = 120  # wines per quick-estimate request (big lists only)
+COLORS = ["Red", "White", "Sparkling", "Rosé", "Orange", "Dessert"]
+
+TRIAGE_TEMPLATE = """You are an expert sommelier and wine-pricing analyst. It is now {year}.
+For EVERY wine below give, quickly and from your own knowledge:
+- retail: the typical current retail (shop) price of that bottle and vintage
+- critic: the typical professional critic score (100-point scale). If you don't know
+  the exact wine, use the producer's usual level, else what that appellation, vintage
+  and price tier typically scores. Never 0.
+Return one estimate per wine, using the same id.
+
+Wines (id | wine | list price):
+"""
 SEARCH_BATCH = 8  # smaller batches when searching, so each wine actually gets looked up
 
 
@@ -425,59 +508,145 @@ def describe(w: ListedWine) -> str:
     return " · ".join(b for b in bits if b) + fmt
 
 
-def analyze(client, model: str, chunks, cur_label: str, prefs: str, use_search: bool, status) -> tuple[WineList, str]:
-    """Step 1: read the list. Step 2: evaluate it in batches (in parallel)."""
-    models = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
-    sym = CURRENCIES[cur_label][0]
+def read_wines(client, models, files, status) -> tuple[str, list[ListedWine], str]:
+    """Step 1: get every wine off the list. Returns (restaurant, wines, model_used)."""
+    wines: list[ListedWine] = []
+    ai_chunks: list[tuple[str, list[types.Part]]] = []
+    for f in files:
+        data = f.getvalue()
+        if f.name.lower().endswith(".pdf"):
+            try:
+                parsed, priced = parse_pdf_text(data)
+            except Exception:
+                parsed, priced = [], 0
+            if len(parsed) >= 15 and len(parsed) >= 0.6 * priced:
+                status.write(f"📄 {f.name}: read {len(parsed):,} wines directly from the PDF text")
+                wines += parsed
+                continue
+            for label, pdf in split_pdf(data):
+                ai_chunks.append((f"{f.name} {label}",
+                                  [types.Part.from_bytes(data=pdf, mime_type="application/pdf")]))
+        else:
+            ai_chunks.append((f.name, [prepare_image(data)]))
+    if not ai_chunks:
+        return "", wines, models[0]
 
-    status.update(label=f"Step 1 of 2: reading the wine list ({len(chunks)} part(s))… (20–60 s)")
+    status.update(label=f"Step 1: reading the wine list ({len(ai_chunks)} part(s))… (20–60 s)")
     read: dict[int, ListedWines] = {}
-    used_models = []
-    read_msgs: list[str] = []
+    used_models, msgs = [], []
 
     def read_chunk(parts):
-        out, m = with_fallback(client, models, [*parts, EXTRACT_PROMPT], ListedWines, read_msgs.append)
+        out, m = with_fallback(client, models, [*parts, EXTRACT_PROMPT], ListedWines, msgs.append)
         used_models.append(m)
         return out
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(read_chunk, parts): i for i, (_, parts) in enumerate(chunks)}
+        futures = {pool.submit(read_chunk, parts): i for i, (_, parts) in enumerate(ai_chunks)}
         for fut in as_completed(futures):
             i = futures[fut]
             try:
                 read[i] = fut.result()
-                status.write(f"📄 {chunks[i][0]}: {len(read[i].wines)} wines")
+                status.write(f"📄 {ai_chunks[i][0]}: {len(read[i].wines)} wines")
             except Exception as e:
-                read_msgs.append(f"⚠️ Couldn't read {chunks[i][0]}: {str(e)[:150]}")
-    for m in dict.fromkeys(read_msgs):
+                msgs.append(f"⚠️ Couldn't read {ai_chunks[i][0]}: {str(e)[:150]}")
+    for m in dict.fromkeys(msgs):
         status.write(m)
-    if not read:
-        raise RuntimeError("ALL_BUSY\n\n" + "\n".join(read_msgs))
-    used = used_models[0]
+    if not read and not wines:
+        raise RuntimeError("ALL_BUSY\n\n" + "\n".join(msgs))
     restaurant = next((r.restaurant for _, r in sorted(read.items()) if r.restaurant), "")
-    wines, seen = [], set()
     for _, r in sorted(read.items()):  # keep list order
-        for w in r.wines:
-            key = (w.producer.lower(), w.name.lower(), w.vintage, size_ml(w.format), w.list_price)
-            if w.list_price > 0 and key not in seen:
-                seen.add(key)
-                wines.append(w)
+        wines += r.wines
+    return restaurant, wines, (used_models or models)[0]
+
+
+def in_scope(w: ListedWine, scope: dict) -> bool:
+    ml = size_ml(w.format)
+    if ml < 750 and not scope["include_small"]:
+        return False
+    if scope["max_price"] and w.list_price > scope["max_price"]:
+        return False
+    color = "Rosé" if w.color == "Orange" and "Orange" not in scope["colors"] else w.color
+    return not color or color not in COLORS or color in scope["colors"]
+
+
+def analyze(client, model: str, files, cur_label: str, prefs: str, use_search: bool,
+            scope: dict, status) -> tuple[WineList, str]:
+    """Read the list, narrow it to what the diner wants, then evaluate.
+
+    Big lists (hundreds or thousands of wines) get a quick price/critic estimate for every
+    wine first, and only the most promising `deep_n` get the full evaluation, which keeps
+    a 2,500-wine list within free-plan limits.
+    """
+    models = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
+    sym = CURRENCIES[cur_label][0]
+
+    status.update(label="Step 1: reading the wine list…")
+    restaurant, listed, used = read_wines(client, models, files, status)
+    wines, seen = [], set()
+    for w in listed:
+        key = (w.producer.lower(), w.name.lower(), w.vintage, size_ml(w.format), w.list_price)
+        if w.list_price > 0 and key not in seen:
+            seen.add(key)
+            wines.append(w)
+    total = len(wines)
+    wines = [w for w in wines if in_scope(w, scope)]
+    status.write(f"🎯 {len(wines):,} of {total:,} wines match what you're looking for")
     if not wines:
-        return WineList(currency=sym, restaurant=restaurant, wines=[]), used
-    status.write(f"📋 Found {len(wines)} wines in total")
+        return WineList(currency=sym, restaurant=restaurant, wines=[], total_listed=total), used
 
     # Keep using whichever model worked, with the others as backups
     models = [used, *[m for m in models if m != used]]
-    size = SEARCH_BATCH if use_search else EVAL_BATCH
-    batches = [list(range(i, min(i + size, len(wines)))) for i in range(0, len(wines), size)]
-    evals: dict[int, Evaluation] = {}
     messages: list[str] = []
+    notes = currency_note(cur_label)
+
+    def line(i):
+        return f"{i} | {describe(wines[i])} | {sym}{wines[i].list_price:g}"
+
+    # --- quick pass (big lists only): rough retail + critic score for every wine
+    quick: dict[int, QuickEstimate] = {}
+    deep_ids = list(range(len(wines)))
+    if len(wines) > scope["deep_n"]:
+        batches = [deep_ids[i : i + TRIAGE_BATCH] for i in range(0, len(wines), TRIAGE_BATCH)]
+        status.update(label=f"Step 2: quick price & critic check of {len(wines):,} wines…")
+        prompt0 = TRIAGE_TEMPLATE.replace("{year}", str(THIS_YEAR))
+
+        def run_quick(ids):
+            prompt = prompt0 + "\n".join(line(i) for i in ids) + "\n" + notes
+            out, _ = with_fallback(client, models, prompt, QuickEstimates, messages.append)
+            return out.estimates
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for fut in as_completed([pool.submit(run_quick, ids) for ids in batches]):
+                try:
+                    for q in fut.result():
+                        if 0 <= q.id < len(wines):
+                            quick[q.id] = q
+                except Exception as e:
+                    messages.append(f"⚠️ A quick-check batch failed: {str(e)[:150]}")
+                done += 1
+                status.update(label=f"Step 2: quick check {done}/{len(batches)} batches…")
+
+        def prelim(i):
+            q = quick.get(i)
+            if not q or q.retail <= 0:
+                return -1
+            markup_pts = 100 * _clamp01((4.0 - wines[i].list_price / q.retail) / 2.5)
+            critic_pts = 100 * _clamp01((q.critic - 84) / 12)
+            return 0.55 * markup_pts + 0.45 * critic_pts
+
+        deep_ids = sorted(quick, key=prelim, reverse=True)[: scope["deep_n"]]
+        status.write(f"🔬 Researching the top {len(deep_ids)} candidates in depth")
+
+    # --- full evaluation of the shortlist
+    size = SEARCH_BATCH if use_search else EVAL_BATCH
+    batches = [deep_ids[i : i + size] for i in range(0, len(deep_ids), size)]
+    evals: dict[int, Evaluation] = {}
     sources: dict[str, str] = {}
     search_ok = [use_search]  # flips off for the rest of the scan if search stops working
 
     def run_batch(ids):
-        lines = "\n".join(f"{i} | {describe(wines[i])} | {sym}{wines[i].list_price:g}" for i in ids)
-        prompt = EVAL_PROMPT + lines + "\n" + currency_note(cur_label) + prefs_note(prefs)
+        prompt = EVAL_PROMPT + "\n".join(line(i) for i in ids) + "\n" + notes + prefs_note(prefs)
         if search_ok[0]:
             for m in models[:2]:
                 try:
@@ -494,22 +663,21 @@ def analyze(client, model: str, chunks, cur_label: str, prefs: str, use_search: 
         return out.evaluations
 
     how = "checking reviews online" if use_search else "evaluating"
-    status.update(label=f"Step 2 of 2: {how} for {len(wines)} wines… (1–3 min)")
+    status.update(label=f"Step 3: {how} for {len(deep_ids)} wines… (1–3 min)")
     done = 0
     with ThreadPoolExecutor(max_workers=3) as pool:  # modest parallelism for free-tier rate limits
-        futures = [pool.submit(run_batch, ids) for ids in batches]
-        for fut in as_completed(futures):
+        for fut in as_completed([pool.submit(run_batch, ids) for ids in batches]):
             try:
                 for e in fut.result():
                     evals[e.id] = e
             except Exception as e:  # one failed batch shouldn't lose the whole list
                 messages.append(f"⚠️ A batch failed: {str(e)[:200]}")
             done += 1
-            status.update(label=f"Step 2 of 2: evaluated {done}/{len(batches)} batches…")
+            status.update(label=f"Step 3: evaluated {done}/{len(batches)} batches…")
 
-    # Re-ask once for any wines the model skipped
-    missing = [i for i in range(len(wines)) if i not in evals]
-    if missing and len(missing) < len(wines):
+    # Re-ask once for any shortlisted wines the model skipped
+    missing = [i for i in deep_ids if i not in evals]
+    if missing and len(missing) < len(deep_ids):
         status.write(f"🔁 Re-checking {len(missing)} wines that were skipped…")
         try:
             for e in run_batch(missing):
@@ -518,17 +686,23 @@ def analyze(client, model: str, chunks, cur_label: str, prefs: str, use_search: 
             messages.append(f"⚠️ Re-check failed: {str(e)[:200]}")
     for m in dict.fromkeys(messages):
         status.write(m)
-    if not evals:
+    if not evals and not quick:
         raise RuntimeError("ALL_BUSY\n\n" + "\n".join(messages))
 
     merged = []
     for i, w in enumerate(wines):
-        e = evals.get(i)
-        extra = e.model_dump(exclude={"id"}) if e else {}
+        if i in evals:
+            extra = evals[i].model_dump(exclude={"id"})
+        elif i in quick:
+            extra = {"est_retail_price": quick[i].retail, "critic_score": quick[i].critic,
+                     "quality_basis": "Quick estimate", "retail_confidence": "Medium"}
+        else:
+            extra = {}
         merged.append(Wine(**w.model_dump(), **extra))
     return WineList(
         currency=sym, restaurant=restaurant, wines=merged,
         sources=[(t, u) for u, t in sources.items()],
+        total_listed=total, researched=len(evals),
     ), used
 
 
@@ -689,6 +863,7 @@ with tab_camera:
     snap = st.camera_input("Take a photo of the list")
 
 files = list(uploads or []) + ([snap] if snap else [])
+files_key = None
 
 if files:
     previews = [f for f in files if not f.name.lower().endswith(".pdf")]
@@ -712,12 +887,40 @@ if files:
         key="currency",
         help="Retail prices are estimated for this country, so pick where the restaurant is.",
     )
-    files_key = (tuple((f.name, f.size) for f in files), cur_label, prefs.strip(), use_search)
+    with st.expander("🎯 What to look at", expanded=True):
+        named = re.findall(r"(?:focus on|only|just|stick to)\s+(?:the\s+)?(red|white|sparkling|champagne|ros[eé]|orange|sweet|dessert)", prefs, re.I)
+        alias = {"champagne": "Sparkling", "rose": "Rosé", "rosé": "Rosé", "sweet": "Dessert"}
+        pref_colors = list(dict.fromkeys(alias.get(c.lower(), c.title()) for c in named))
+        c1, c2, c3 = st.columns([3, 2, 2])
+        scope_colors = c1.multiselect(
+            "Wine types", COLORS, default=pref_colors or COLORS,
+            key="scope_colors_" + "_".join(pref_colors),  # re-defaults when My taste names a type
+        )
+        max_price = c2.number_input(
+            f"Max list price ({CURRENCIES[cur_label][0]}, 0 = any)", min_value=0, value=0, step=25,
+            key="scope_max",
+        )
+        include_small = c3.checkbox(
+            "Include half bottles & small formats",
+            value=bool(re.search(r"375|half[- ]?bottle|halves|500\s*ml", prefs, re.I)),
+            key="scope_small",
+        )
+        deep_n = st.slider(
+            "How many top candidates to research in depth", 10, 100, 40, step=10, key="scope_deep",
+            help="Big lists get a quick price & critic check for every wine, then only the most "
+            "promising ones get the full treatment (web reviews, drinking window, your taste). "
+            "Higher = more thorough but slower and uses more of your free Gemini quota.",
+        )
+    scope = {"colors": scope_colors, "max_price": max_price, "include_small": include_small, "deep_n": deep_n}
+    files_key = (
+        tuple((f.name, f.size) for f in files), cur_label, prefs.strip(), use_search,
+        tuple(sorted(scope_colors)), max_price, include_small, deep_n,
+    )
     if st.button("🔍 Analyze Wine List", type="primary"):
         with st.status("Analyzing…", expanded=False) as status:
             try:
                 result, used = analyze(
-                    client, model, to_chunks(files), cur_label, prefs, use_search, status
+                    client, model, files, cur_label, prefs, use_search, scope, status
                 )
                 st.session_state["result"] = result
                 st.session_state["files_key"] = files_key
@@ -741,12 +944,7 @@ if files:
                 st.stop()
 
 result = st.session_state.get("result")
-current_key = (
-    tuple((f.name, f.size) for f in files),
-    st.session_state.get("currency"),
-    prefs.strip(),
-    use_search,
-)
+current_key = files_key
 if result and files and st.session_state.get("files_key") != current_key:
     if st.session_state.get("files_key", (None,))[0] == current_key[0]:
         st.info("Settings changed. Press **Analyze Wine List** again to update the results.")
@@ -771,6 +969,12 @@ elif result and files:
         st.stop()
 
     st.subheader(f"📊 Value Analysis{' — ' + result.restaurant if result.restaurant else ''}")
+    if result.total_listed and result.researched < len(result.wines):
+        st.caption(
+            f"📋 {result.total_listed:,} wines on the list · {len(result.wines):,} matched your choices · "
+            f"🔬 top {result.researched} researched in depth. The rest have a quick price & critic "
+            "estimate only ('Based on: Quick estimate')."
+        )
 
     # --- filters
     f1, f2, f3 = st.columns([2, 2, 2])
@@ -779,7 +983,7 @@ elif result and files:
     lo, hi = float(df["List"].min()), float(df["List"].max())
     budget = f2.slider(f"Max list price ({cur})", lo, hi, hi) if hi > lo else hi
     sizes = sorted(df["Size"].unique(), key=lambda x: (x != "Standard (750ml)", not x.startswith("Large"), x))
-    wants_small = bool(re.search(r"375|half[- ]?bottle|halves|500\s*ml", prefs, re.I))
+    wants_small = bool(st.session_state.get("scope_small"))
     default_sizes = [x for x in sizes if x.startswith(("Standard", "Large")) or (wants_small and x.startswith(("Small", "Half")))]
     pick_sizes = f3.multiselect("Bottle size", sizes, default=default_sizes or sizes)
 
@@ -793,7 +997,9 @@ elif result and files:
     m4.metric("Drinking well now", int((df["Readiness"] == "🟢 Drinking well").sum()))
 
     # --- top picks
-    picks = view[(view["Confidence"] != "Low") & (view["Score"] >= 60)].head(3)
+    picks = view[
+        (view["Confidence"] != "Low") & (view["Score"] >= 60) & (view["Based on"] != "Quick estimate")
+    ].head(3)
     if not picks.empty:
         st.markdown("#### 🏆 Sommelier's picks")
         for col, (_, w) in zip(st.columns(len(picks)), picks.iterrows()):
@@ -822,7 +1028,7 @@ elif result and files:
             "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
             "Critics": st.column_config.NumberColumn(format="%d pts"),
             "Based on": st.column_config.TextColumn(
-                help="Web reviews = found via Google Search · This wine = known reviews · Producer = producer's usual level · "
+                help="Web reviews = found via Google Search · Quick estimate = big-list first pass only · This wine = known reviews · Producer = producer's usual level · "
                 "Region/style = typical for that appellation, grape and price (least certain)"
             ),
             "List": st.column_config.NumberColumn(format=f"{cur}%.0f"),
