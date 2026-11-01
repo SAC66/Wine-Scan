@@ -12,6 +12,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from pypdf import PdfReader, PdfWriter
 
 try:  # iPhone photos are often HEIC; support them if pillow-heif is installed
     from pillow_heif import register_heif_opener
@@ -45,7 +46,7 @@ class ListedWine(BaseModel):
     region: str = Field(description="Region / appellation and country")
     grape: str = Field(description="Main grape(s)")
     color: str = Field(description="One of: Red, White, Rosé, Sparkling, Dessert, Orange")
-    format: str = Field(description="Bottle size, e.g. '750ml'; 'Glass' if it is a by-the-glass price")
+    format: str = Field(description="Bottle size in ml, e.g. '750ml', '375ml', '1500ml'; 'Glass' for a by-the-glass price. Use 750ml unless the wine's own line or its section heading explicitly says otherwise")
     list_price: float = Field(description="Price on the wine list, number only")
 
 
@@ -116,7 +117,11 @@ Extract EVERY wine on it. For each wine, record producer, name, vintage, region,
 color, format and list price exactly as printed (fill region/grape from your knowledge
 if the list only implies them, e.g. by its section heading). If both a glass and a
 bottle price are shown, use the bottle price. Skip beers, spirits, cocktails and
-other non-wine items. Do not skip any wine, however long the list."""
+other non-wine items. Do not skip any wine, however long the list.
+
+Bottle size: use 750ml unless that wine's own line, or the heading of the section it
+sits in, explicitly gives another size (e.g. "Half Bottles" → 375ml, "Magnums" →
+1500ml). A size heading applies only to the wines under it, not to the rest of the list."""
 
 EVAL_TEMPLATE = """You are an expert sommelier and wine-pricing analyst. It is now {year}.
 
@@ -270,16 +275,71 @@ def prepare_image(data: bytes) -> types.Part:
     return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
 
 
-def to_parts(files) -> list[types.Part]:
-    parts = []
+PDF_PAGES_PER_CHUNK = 2  # long lists overflow one answer, so read a couple of pages at a time
+
+
+def split_pdf(data: bytes) -> list[tuple[str, bytes]]:
+    """Split a PDF into small page groups: [(label, pdf_bytes), ...]."""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        n = len(reader.pages)
+        if n <= PDF_PAGES_PER_CHUNK:
+            return [(f"pages 1–{n}", data)]
+        out = []
+        for start in range(0, n, PDF_PAGES_PER_CHUNK):
+            writer = PdfWriter()
+            end = min(start + PDF_PAGES_PER_CHUNK, n)
+            for i in range(start, end):
+                writer.add_page(reader.pages[i])
+            buf = io.BytesIO()
+            writer.write(buf)
+            out.append((f"pages {start + 1}–{end}", buf.getvalue()))
+        return out
+    except Exception:  # unreadable by pypdf: let Gemini have the whole thing
+        return [("whole PDF", data)]
+
+
+def to_chunks(files) -> list[tuple[str, list[types.Part]]]:
+    """Each chunk is read separately: one photo, or a couple of PDF pages."""
+    chunks = []
     for f in files:
         data = f.getvalue()
         if f.name.lower().endswith(".pdf"):
-            # Send the PDF itself — Gemini reads layout and scanned pages, unlike text extraction.
-            parts.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
+            # Send PDF pages themselves — Gemini reads layout and scanned pages, unlike text extraction.
+            for label, pdf in split_pdf(data):
+                part = types.Part.from_bytes(data=pdf, mime_type="application/pdf")
+                chunks.append((f"{f.name} {label}", [part]))
         else:
-            parts.append(prepare_image(data))
-    return parts
+            chunks.append((f.name, [prepare_image(data)]))
+    return chunks
+
+
+def size_ml(fmt: str) -> int:
+    """'375ml' -> 375, '1.5L' -> 1500, 'Magnum' -> 1500, 'Glass' -> 0; default 750."""
+    f = (fmt or "").lower().replace(" ", "")
+    if "glass" in f or "btg" in f:
+        return 0
+    if "half" in f:
+        return 375
+    if "magnum" in f:
+        return 1500
+    m = re.search(r"(\d+(?:\.\d+)?)(ml|cl|l)", f)
+    if not m:
+        return 750
+    n = float(m.group(1))
+    return int(n * {"ml": 1, "cl": 10, "l": 1000}[m.group(2)])
+
+
+def size_label(ml: int) -> str:
+    if ml == 0:
+        return "Glass"
+    if ml == 375:
+        return "Half bottle (375ml)"
+    if ml < 750:
+        return f"Small ({ml}ml)"
+    if ml == 750:
+        return "Standard (750ml)"
+    return f"Large ({ml / 1000:g}L)"
 
 
 EVAL_BATCH = 15  # wines per evaluation request: small enough that every wine gets attention
@@ -365,17 +425,46 @@ def describe(w: ListedWine) -> str:
     return " · ".join(b for b in bits if b) + fmt
 
 
-def analyze(client, model: str, parts, cur_label: str, prefs: str, use_search: bool, status) -> tuple[WineList, str]:
+def analyze(client, model: str, chunks, cur_label: str, prefs: str, use_search: bool, status) -> tuple[WineList, str]:
     """Step 1: read the list. Step 2: evaluate it in batches (in parallel)."""
     models = list(dict.fromkeys([model, *FALLBACK_MODELS, *EXTRA_ANALYSIS_FALLBACKS]))
     sym = CURRENCIES[cur_label][0]
 
-    status.update(label="Step 1 of 2: reading the wine list… (20–60 s)")
-    listed, used = with_fallback(client, models, [*parts, EXTRACT_PROMPT], ListedWines, status.write)
-    wines = [w for w in listed.wines if w.list_price > 0]
+    status.update(label=f"Step 1 of 2: reading the wine list ({len(chunks)} part(s))… (20–60 s)")
+    read: dict[int, ListedWines] = {}
+    used_models = []
+    read_msgs: list[str] = []
+
+    def read_chunk(parts):
+        out, m = with_fallback(client, models, [*parts, EXTRACT_PROMPT], ListedWines, read_msgs.append)
+        used_models.append(m)
+        return out
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(read_chunk, parts): i for i, (_, parts) in enumerate(chunks)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                read[i] = fut.result()
+                status.write(f"📄 {chunks[i][0]}: {len(read[i].wines)} wines")
+            except Exception as e:
+                read_msgs.append(f"⚠️ Couldn't read {chunks[i][0]}: {str(e)[:150]}")
+    for m in dict.fromkeys(read_msgs):
+        status.write(m)
+    if not read:
+        raise RuntimeError("ALL_BUSY\n\n" + "\n".join(read_msgs))
+    used = used_models[0]
+    restaurant = next((r.restaurant for _, r in sorted(read.items()) if r.restaurant), "")
+    wines, seen = [], set()
+    for _, r in sorted(read.items()):  # keep list order
+        for w in r.wines:
+            key = (w.producer.lower(), w.name.lower(), w.vintage, size_ml(w.format), w.list_price)
+            if w.list_price > 0 and key not in seen:
+                seen.add(key)
+                wines.append(w)
     if not wines:
-        return WineList(currency=sym, restaurant=listed.restaurant, wines=[]), used
-    status.write(f"📋 Found {len(wines)} wines")
+        return WineList(currency=sym, restaurant=restaurant, wines=[]), used
+    status.write(f"📋 Found {len(wines)} wines in total")
 
     # Keep using whichever model worked, with the others as backups
     models = [used, *[m for m in models if m != used]]
@@ -438,7 +527,7 @@ def analyze(client, model: str, parts, cur_label: str, prefs: str, use_search: b
         extra = e.model_dump(exclude={"id"}) if e else {}
         merged.append(Wine(**w.model_dump(), **extra))
     return WineList(
-        currency=sym, restaurant=listed.restaurant, wines=merged,
+        currency=sym, restaurant=restaurant, wines=merged,
         sources=[(t, u) for u, t in sources.items()],
     ), used
 
@@ -507,7 +596,7 @@ def to_frame(result: WineList, weights: dict) -> pd.DataFrame:
                 "Region": w.region,
                 "Grape": w.grape,
                 "Color": w.color,
-                "Format": w.format,
+                "Size": size_label(size_ml(w.format)),
                 "List": w.list_price,
                 "Est. Retail": w.est_retail_price or None,
                 "Markup": round(markup, 2) if markup else None,
@@ -628,7 +717,7 @@ if files:
         with st.status("Analyzing…", expanded=False) as status:
             try:
                 result, used = analyze(
-                    client, model, to_parts(files), cur_label, prefs, use_search, status
+                    client, model, to_chunks(files), cur_label, prefs, use_search, status
                 )
                 st.session_state["result"] = result
                 st.session_state["files_key"] = files_key
@@ -684,16 +773,17 @@ elif result and files:
     st.subheader(f"📊 Value Analysis{' — ' + result.restaurant if result.restaurant else ''}")
 
     # --- filters
-    f1, f2, f3 = st.columns([2, 2, 1])
+    f1, f2, f3 = st.columns([2, 2, 2])
     colors = sorted(df["Color"].dropna().unique())
     pick_colors = f1.multiselect("Color", colors, default=colors)
     lo, hi = float(df["List"].min()), float(df["List"].max())
     budget = f2.slider(f"Max list price ({cur})", lo, hi, hi) if hi > lo else hi
-    bottles_only = f3.checkbox("Bottles only", value=True)
+    sizes = sorted(df["Size"].unique(), key=lambda x: (x != "Standard (750ml)", not x.startswith("Large"), x))
+    wants_small = bool(re.search(r"375|half[- ]?bottle|halves|500\s*ml", prefs, re.I))
+    default_sizes = [x for x in sizes if x.startswith(("Standard", "Large")) or (wants_small and x.startswith(("Small", "Half")))]
+    pick_sizes = f3.multiselect("Bottle size", sizes, default=default_sizes or sizes)
 
-    view = df[df["Color"].isin(pick_colors) & (df["List"] <= budget)]
-    if bottles_only:
-        view = view[~view["Format"].str.contains("glass", case=False, na=False)]
+    view = df[df["Color"].isin(pick_colors) & (df["List"] <= budget) & df["Size"].isin(pick_sizes)]
 
     # --- headline metrics
     m1, m2, m3, m4 = st.columns(4)
