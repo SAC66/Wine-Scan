@@ -978,6 +978,25 @@ try:
         (get_secret("GEMINI_USE_VERTEX", "") or "").lower() in ("1", "true", "yes"),
     )
 except Exception as e:
+    # Judge by the standard Gemini API's answer; the Vertex AI fallback rejects most keys anyway
+    msg = str(e)
+    gem = "\n".join(b for b in msg.split("\n\n") if b.startswith("Gemini API")) or msg
+    key_bad = any(k in gem for k in ("API key not valid", "API_KEY_INVALID", "UNAUTHENTICATED",
+                                     "PERMISSION_DENIED", "401", "403"))
+    if not key_bad and ("429" in gem or "RESOURCE_EXHAUSTED" in gem):
+        st.error(
+            "This Gemini key has used up its **free daily limit**. The key itself is fine. The "
+            "limit resets around midnight US Pacific time. To keep going now, turn on billing for "
+            "the key in AI Studio (**Set up billing** next to the key)."
+        )
+        with st.expander("Technical details"):
+            st.code(msg)
+        st.stop()
+    if not key_bad and any(k in gem for k in ("503", "UNAVAILABLE", "500", "timed out", "timeout")):
+        st.error("Google's Gemini servers are busy right now. Wait a minute and reload the page.")
+        with st.expander("Technical details"):
+            st.code(msg)
+        st.stop()
     if friend_mode:
         st.error(
             "Google didn't accept your Gemini key (ending in "
