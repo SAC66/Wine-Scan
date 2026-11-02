@@ -877,29 +877,14 @@ st.caption(
     "values and under-the-radar bottles. Retail prices are AI estimates. Use them as a guide, not gospel."
 )
 
-def user_key(code: str) -> str | None:
-    """Look up a friend's Gemini key by the code in their link (?u=CODE).
-
-    Keys live in Secrets under [USER_KEYS], so the link only carries a made-up code,
-    never the key itself.
-    """
-    try:
-        keys = st.secrets.get("USER_KEYS", {})
-        key = keys.get(code)
-        return str(key).strip().strip("\"'") if key else None
-    except Exception:
-        return None
-
-
-KEY_STORE = "wine_scan_gemini_key"  # browser localStorage name for a friend's own key
 KEY_OK = re.compile(r"^[A-Za-z0-9._\-]{20,200}$")
 
 
-def friend_key() -> str:
-    """For ?friend links: the visitor's own Gemini key, kept only in their browser.
+def friend_key(store: str) -> str:
+    """A signed-in guest's own Gemini key, kept only in their browser under `store`.
 
     First visit shows a one-time setup; afterwards the key is read back from the phone's
-    local storage, so the link itself never contains a key and the owner's key is never used.
+    local storage, so the key never leaves their device and the owner's key is never used.
     """
     gen = st.session_state.setdefault("key_gen", 0)  # bumped by "Use a different key"
     if st.session_state.get("friend_key"):
@@ -907,15 +892,15 @@ def friend_key() -> str:
         if not st.session_state.get("friend_key_saved"):
             # Runs once in the browser to remember the key on this device
             streamlit_js_eval(
-                js_expressions=f"localStorage.setItem('{KEY_STORE}', '{key}')", key=f"save_key_{gen}"
+                js_expressions=f"localStorage.setItem('{store}', '{key}')", key=f"save_key_{gen}"
             )
             st.session_state["friend_key_saved"] = True
         return key
     if st.session_state.get("forget_key"):
-        streamlit_js_eval(js_expressions=f"localStorage.removeItem('{KEY_STORE}')", key=f"forget_key_{gen}")
+        streamlit_js_eval(js_expressions=f"localStorage.removeItem('{store}')", key=f"forget_key_{gen}")
     else:
         stored = streamlit_js_eval(
-            js_expressions=f"localStorage.getItem('{KEY_STORE}') || ''", key="load_key"
+            js_expressions=f"localStorage.getItem('{store}') || ''", key="load_key"
         )
         if stored is None:  # the browser hasn't answered yet; the page reruns when it does
             st.caption("Loading…")
@@ -943,47 +928,58 @@ def friend_key() -> str:
     st.stop()
 
 
-def secret_table(name: str) -> dict:
+def auth_configured() -> bool:
     try:
-        return {str(k): str(v) for k, v in st.secrets.get(name, {}).items()}
+        return bool(st.secrets.get("auth", {}).get("client_id"))
     except Exception:
-        return {}
+        return False
 
 
-user_code = (st.query_params.get("u") or "").strip()
-invite = (st.query_params.get("invite") or "").strip()
-friend_mode = bool(invite)
-if friend_mode:
-    # Personal invites: only codes listed under [INVITES] in Secrets work. Removing a line
-    # there switches that person off, even if their phone has already saved a key.
-    guest = secret_table("INVITES").get(invite)
-    if not guest:
-        st.error("This invite link isn't valid any more. Ask whoever sent it for a new one.")
+def guest_list() -> set[str]:
+    try:
+        emails = st.secrets.get("ALLOWED_EMAILS", [])
+    except Exception:
+        emails = []
+    if isinstance(emails, str):
+        emails = re.split(r"[,\s]+", emails)
+    return {str(e).strip().lower() for e in emails if str(e).strip()}
+
+
+# --- who's using the app: Google sign-in, limited to the owner + ALLOWED_EMAILS.
+# Until [auth] is set up in Secrets the app stays open and uses the owner's key.
+friend_mode = False
+if auth_configured():
+    if not st.user.is_logged_in:
+        st.markdown("🔒 This app is private. Sign in with the Google account you were invited with.")
+        if st.button("Sign in with Google", type="primary"):
+            st.login()
         st.stop()
-    if not st.session_state.get("friend_key"):
-        st.markdown(f"Welcome, **{guest}**! 🍷")
-    api_key = friend_key()
+    email = (st.user.email or "").strip().lower()
+    owner = (get_secret("OWNER_EMAIL") or "").strip().lower()
+    if email != owner and email not in guest_list():
+        st.error(f"**{email}** isn't on this app's guest list. Ask the app's owner to add you.")
+        if st.button("Sign out"):
+            st.logout()
+        st.stop()
     with st.sidebar:
-        st.divider()
+        st.caption(f"Signed in as {email}")
+        if st.button("Sign out"):
+            st.logout()
+    own_key = str(get_secret("FRIENDS_USE_OWN_KEY", "true")).lower() not in ("false", "0", "no")
+    friend_mode = email != owner and own_key
+
+if friend_mode:
+    # Guests run scans on their own free key, remembered per account on their phone
+    store = "wine_scan_key_" + re.sub(r"[^a-z0-9]", "_", email)
+    api_key = friend_key(store)
+    with st.sidebar:
         if st.button("🔑 Use a different Gemini key"):
             for k in ("friend_key", "friend_key_saved"):
                 st.session_state.pop(k, None)
             st.session_state["forget_key"] = True
             st.session_state["key_gen"] += 1
             st.rerun()
-elif user_code:
-    api_key = user_key(user_code)
-    if not api_key:
-        # Never fall back to the owner's key for a shared link
-        st.error("This link isn't set up (unknown code). Ask whoever sent it for a new link.")
-        st.stop()
 else:
-    # Optional lock: with OWNER_CODE set, the owner's key only works from ?me=OWNER_CODE,
-    # so nobody can use it by trimming an invite link down to the bare address.
-    owner_code = get_secret("OWNER_CODE")
-    if owner_code and (st.query_params.get("me") or "").strip() != owner_code:
-        st.info("This app is invite-only. Ask the person who shared it for your personal link.")
-        st.stop()
     api_key = get_secret("GEMINI_API_KEY")
 if not api_key:
     st.error(
