@@ -943,9 +943,25 @@ def friend_key() -> str:
     st.stop()
 
 
+def secret_table(name: str) -> dict:
+    try:
+        return {str(k): str(v) for k, v in st.secrets.get(name, {}).items()}
+    except Exception:
+        return {}
+
+
 user_code = (st.query_params.get("u") or "").strip()
-friend_mode = "friend" in st.query_params
+invite = (st.query_params.get("invite") or "").strip()
+friend_mode = bool(invite)
 if friend_mode:
+    # Personal invites: only codes listed under [INVITES] in Secrets work. Removing a line
+    # there switches that person off, even if their phone has already saved a key.
+    guest = secret_table("INVITES").get(invite)
+    if not guest:
+        st.error("This invite link isn't valid any more. Ask whoever sent it for a new one.")
+        st.stop()
+    if not st.session_state.get("friend_key"):
+        st.markdown(f"Welcome, **{guest}**! 🍷")
     api_key = friend_key()
     with st.sidebar:
         st.divider()
@@ -962,6 +978,12 @@ elif user_code:
         st.error("This link isn't set up (unknown code). Ask whoever sent it for a new link.")
         st.stop()
 else:
+    # Optional lock: with OWNER_CODE set, the owner's key only works from ?me=OWNER_CODE,
+    # so nobody can use it by trimming an invite link down to the bare address.
+    owner_code = get_secret("OWNER_CODE")
+    if owner_code and (st.query_params.get("me") or "").strip() != owner_code:
+        st.info("This app is invite-only. Ask the person who shared it for your personal link.")
+        st.stop()
     api_key = get_secret("GEMINI_API_KEY")
 if not api_key:
     st.error(
