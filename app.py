@@ -953,6 +953,21 @@ if auth_configured():
         st.markdown("🔒 This app is private. Sign in with the Google account you were invited with.")
         if st.button("Sign in with Google", type="primary"):
             st.login()
+        with st.expander("Trouble signing in?"):
+            # Shows what came back from Google, to diagnose sign-in loops (no secrets here)
+            try:
+                user_info = st.user.to_dict()
+            except Exception as e:
+                user_info = f"unavailable: {e}"
+            try:
+                import authlib
+                authlib_version = authlib.__version__
+            except Exception as e:
+                authlib_version = f"missing ({e})"
+            st.code(
+                f"streamlit {st.__version__}\nauthlib {authlib_version}\n"
+                f"query params: {dict(st.query_params)}\nuser: {user_info}"
+            )
         st.stop()
     email = (st.user.email or "").strip().lower()
     owner = (get_secret("OWNER_EMAIL") or "").strip().lower()
